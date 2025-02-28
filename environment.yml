@@ -55,6 +55,7 @@ dependencies:
   - zipp=3.21.0
   - zlib=1.2.13
   - pip:
+      - -e .
       - filelock==3.17.0
       - flow-decomposition==0.0.1
       - fsspec==2025.2.0
