@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 class FlowDecomposition:
     def __init__(self, input_dim, proj_dim, n_components, 
-                 num_delays=None, delay_step=None, subtract_corr=False, 
+                 num_delays=None, delay_step=None, subtract_autocorr=False, 
                  device="cuda", optimizer="Adam", learning_rate=0.01, random_state=None):
 
         self.device = device
@@ -21,7 +21,7 @@ class FlowDecomposition:
         self.random_state = random_state
 
         self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
-        self.subtract_corr = subtract_corr
+        self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
 
         if (num_delays is None) or (delay_step is None) or (num_delays == 0) or (delay_step == 0):
@@ -30,66 +30,60 @@ class FlowDecomposition:
             self.use_delay = True
 
     def fit(self, X, 
-            sample_len, 
-            library_len, 
+            sample_size, 
+            library_size, 
             exclusion_rad=0,
             theta=None, 
-            tp=1, 
-            epochs=100, 
+            time_intv=1, 
+            num_epochs=100, 
             num_batches=32, 
             beta=0,
-            tp_policy="range", 
-            loss_mask_size=None):
+            pred_policy="range", 
+            mask_size=None):
         
         X = torch.tensor(X,requires_grad=True, device=self.device, dtype=torch.float32)
 
-        if tp_policy == "fixed":
-            dataset = RandomSampleSubsetPairDataset(X=X, sample_size = sample_len,
-                                                    subset_size = library_len, E = self.num_delays, tau=self.delay_step,
-                                                    num_batches = num_batches, tp_range=(tp, tp),
+        if pred_policy == "fixed":
+            dataset = RandomSampleSubsetPairDataset(X=X, sample_size = sample_size,
+                                                    subset_size = library_size, E = self.num_delays, tau=self.delay_step,
+                                                    num_batches = num_batches, tp_range=(time_intv, time_intv),
                                                    device=self.device,random_state=self.random_state)
-        elif tp_policy == "range":
-            dataset = RandomSampleSubsetPairDataset(X=X, sample_size = sample_len,
-                                                    subset_size = library_len, E = self.num_delays, tau=self.delay_step,
-                                                    num_batches = num_batches, tp_range=(1, tp),
+        elif pred_policy == "range":
+            dataset = RandomSampleSubsetPairDataset(X=X, sample_size = sample_size,
+                                                    subset_size = library_size, E = self.num_delays, tau=self.delay_step,
+                                                    num_batches = num_batches, tp_range=(1, time_intv),
                                                    device=self.device,random_state=self.random_state)
         else:
             pass #TODO: pass an exception
 
         dataloader = DataLoader(dataset, batch_size=1, pin_memory=False)
 
-        for epoch in range(epochs):
+        for epoch in range(num_epochs):
             self.optimizer.zero_grad()
 
             ccm_loss = 0
             for subset_idx, sample_idx, subset_X, subset_y, sample_X, sample_y in dataloader:
-                #Shape: [1, E, subset/sample size, data_dim]
+                #Shape: [1, subset/sample size, E, data_dim]
                 subset_X_z = self.model(subset_X[0])
                 sample_X_z = self.model(sample_X[0])
                 subset_y_z = self.model(subset_y[0])
                 sample_y_z = self.model(sample_y[0])
-                #Shape: [E, subset/sample size, proj_dim, n_components]
+                #Shape: [subset/sample size, E, proj_dim, n_components]
 
-                subset_X_z = subset_X_z.permute(1, 0, 2, 3).reshape(subset_X_z.size(1), -1, subset_X_z.size(3))
-                sample_X_z = sample_X_z.permute(1, 0, 2, 3).reshape(sample_X_z.size(1), -1, sample_X_z.size(3))
-                subset_y_z = subset_y_z.permute(1, 0, 2, 3).reshape(subset_y_z.size(1), -1, subset_y_z.size(3))
-                sample_y_z = sample_y_z.permute(1, 0, 2, 3).reshape(sample_y_z.size(1), -1, sample_y_z.size(3))
+                subset_X_z = subset_X_z.reshape(subset_X_z.size(0), -1, subset_X_z.size(3))
+                sample_X_z = sample_X_z.reshape(sample_X_z.size(0), -1, sample_X_z.size(3))
+                subset_y_z = subset_y_z.reshape(subset_y_z.size(0), -1, subset_y_z.size(3))
+                sample_y_z = sample_y_z.reshape(sample_y_z.size(0), -1, sample_y_z.size(3))
                 #Shape: [subset/sample size, E * proj_dim, n_components]
 
-                loss = self.__loss_fn(subset_idx, sample_idx,
+                loss = self.__compute_loss(subset_idx, sample_idx,
                                       sample_X_z, sample_y_z, subset_X_z, subset_y_z, 
-                                      theta, exclusion_rad, loss_mask_size)
+                                      theta, exclusion_rad, mask_size)
 
                 loss /= num_batches
                 ccm_loss += loss
 
-            l1 = sum(p.abs().sum() 
-                    for p in self.model.parameters() if p.requires_grad)
-            l2 = sum(p.norm(2)
-                    for p in self.model.parameters() if p.requires_grad)
-            num_w = torch.tensor(sum(p.numel()
-                    for p in self.model.parameters() if p.requires_grad),dtype=torch.float32)
-            h_norm = 1-(torch.sqrt(num_w) - (l1 / (l2 + 1e-6))) / (torch.sqrt(num_w) - 1)
+            h_norm = self.__compute_h_norm()
             
             total_loss = ccm_loss + beta * h_norm
 
@@ -97,7 +91,7 @@ class FlowDecomposition:
 
             self.optimizer.step()
 
-            print(f'Epoch {epoch + 1}/{epochs}, Loss: {total_loss.item():.4f}, ccm_loss: {ccm_loss.item():.4f}, h_norm_loss: {h_norm.item():.4f}')
+            print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss.item():.4f}, ccm_loss: {ccm_loss.item():.4f}, h_norm_loss: {h_norm.item():.4f}')
             self.loss_history += [total_loss.item()]
 
     def predict(self, X):
@@ -115,17 +109,28 @@ class FlowDecomposition:
             outputs = torch.permute(self.model(inputs),dims=(0,2,1)) #Easier to interpret
         return outputs.cpu().numpy()
 
-    def __loss_fn(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad, loss_mask_size):
+    def __compute_h_norm(self):
+        l1 = sum(p.abs().sum() 
+                for p in self.model.parameters() if p.requires_grad)
+        l2 = sum(p.norm(2)
+                for p in self.model.parameters() if p.requires_grad)
+        num_w = torch.tensor(sum(p.numel()
+                for p in self.model.parameters() if p.requires_grad),dtype=torch.float32)
+        h_norm = 1-(torch.sqrt(num_w) - (l1 / (l2 + 1e-6))) / (torch.sqrt(num_w) - 1)
+
+        return h_norm
+
+    def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad, mask_size):
         dim = self.n_comp
 
-        if loss_mask_size is not None:
-            rand_idx = torch.argsort(torch.rand(dim))[:loss_mask_size]
+        if mask_size is not None:
+            rand_idx = torch.argsort(torch.rand(dim),device=self.device)[:mask_size]
             sample_X = sample_X[:,:,rand_idx]
             sample_y = sample_y[:,:,rand_idx]
             subset_X = subset_X[:,:,rand_idx]
             subset_y = subset_y[:,:,rand_idx]
 
-            dim = loss_mask_size
+            dim = mask_size
 
         ccm = (self.__get_ccm_matrix_approx(subset_idx, 
                                             sample_idx, 
@@ -136,7 +141,7 @@ class FlowDecomposition:
 
         ccm = ccm**2
 
-        if self.subtract_corr:
+        if self.subtract_autocorr:
             corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))**2
             if dim > 1:
                 score = 1 + torch.abs(ccm[:,~mask]).mean() - (ccm[:,mask]).mean() + (corr[:,mask]).mean()
@@ -211,8 +216,11 @@ class FlowDecomposition:
         return weights
     
     def __get_autoreg_matrix_approx(self, A, B):
-        dim = A.shape[-1]
-        E = A.shape[-2]
+        dim = self.n_comp
+        if self.use_delay:
+            E = self.proj_dim * self.num_delays
+        else:
+            E = self.proj_dim
         
         A = A[:,:,None,:].expand(-1, E, dim, dim)
         B = B[:,:,:,None].expand(-1, E, dim, dim)

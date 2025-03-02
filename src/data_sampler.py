@@ -130,7 +130,9 @@ class RandomSampleSubsetPairDataset(Dataset):
 
             sample_indices = sample_candidates.unsqueeze(0)
             subset_indices = subset_candidates.unsqueeze(0)
-        
+
+        sample_indices = sample_indices.T
+        subset_indices = subset_indices.T
         # Retrieve the corresponding data from X and shifted targets from y.
         X_sample = self.X[sample_indices]
         X_subset = self.X[subset_indices]
