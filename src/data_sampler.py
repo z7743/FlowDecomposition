@@ -57,7 +57,7 @@ class RandomSampleSubsetPairDataset(Dataset):
         self.tp_max = int(self.tp_range.max().item())
 
         # Determine whether delay embedding should be used.
-        if (E is None) or (tau is None) or (E == 1 and tau == 0):
+        if (E is None) or (tau is None) or (E == 0) or (tau == 0):
             self.use_delay = False
             self.E = 1
             self.tau = 0

@@ -24,11 +24,6 @@ class LinearModel(nn.Module):
         if random_state != None:
             torch.manual_seed(random_state)
         self.model = nn.Linear(input_dim, n_comp*proj_dim, bias=False,device=self.device)
-    
-    def _init_weights(self, m):
-        init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-        if m.bias is not None:
-            init.zeros_(m.bias)
 
     def forward(self, x):
         x_shape = x.shape

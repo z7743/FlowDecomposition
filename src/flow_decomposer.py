@@ -18,10 +18,16 @@ class FlowDecomposition:
         self.delay_step = delay_step
         self.proj_dim = proj_dim
         self.n_comp = n_components
+        self.random_state = random_state
 
         self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
         self.subtract_corr = subtract_corr
         self.loss_history = []
+
+        if (num_delays is None) or (delay_step is None) or (num_delays == 0) or (delay_step == 0):
+            self.use_delay = False
+        else:
+            self.use_delay = True
 
     def fit(self, X, 
             sample_len, 
@@ -41,13 +47,12 @@ class FlowDecomposition:
             dataset = RandomSampleSubsetPairDataset(X=X, sample_size = sample_len,
                                                     subset_size = library_len, E = self.num_delays, tau=self.delay_step,
                                                     num_batches = num_batches, tp_range=(tp, tp),
-                                                   device=self.device)
+                                                   device=self.device,random_state=self.random_state)
         elif tp_policy == "range":
             dataset = RandomSampleSubsetPairDataset(X=X, sample_size = sample_len,
                                                     subset_size = library_len, E = self.num_delays, tau=self.delay_step,
                                                     num_batches = num_batches, tp_range=(1, tp),
-                                                   device=self.device)
-            
+                                                   device=self.device,random_state=self.random_state)
         else:
             pass #TODO: pass an exception
 
@@ -95,6 +100,20 @@ class FlowDecomposition:
             print(f'Epoch {epoch + 1}/{epochs}, Loss: {total_loss.item():.4f}, ccm_loss: {ccm_loss.item():.4f}, h_norm_loss: {h_norm.item():.4f}')
             self.loss_history += [total_loss.item()]
 
+    def predict(self, X):
+        """
+        Calculates embeddings using the trained model.
+        
+        Args:
+            X (numpy.ndarray): Input data.
+        
+        Returns:
+            numpy.ndarray: Predicted outputs.
+        """
+        with torch.no_grad():
+            inputs = torch.tensor(X, dtype=torch.float32,device=self.device)
+            outputs = torch.permute(self.model(inputs),dims=(0,2,1)) #Easier to interpret
+        return outputs.cpu().numpy()
 
     def __loss_fn(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad, loss_mask_size):
         dim = self.n_comp
@@ -133,12 +152,12 @@ class FlowDecomposition:
         
     def __get_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         dim = self.n_comp
-        if self.num_delays == None:
-            E_x = self.proj_dim
-            E_y = self.proj_dim
-        else:
+        if self.use_delay:
             E_x = self.proj_dim * self.num_delays
             E_y = self.proj_dim * self.num_delays
+        else:
+            E_x = self.proj_dim
+            E_y = self.proj_dim
         sample_size = sample_X.shape[0]
         subset_size = subset_X.shape[0]
 
