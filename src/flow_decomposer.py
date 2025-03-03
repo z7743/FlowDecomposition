@@ -8,8 +8,22 @@ from torch.utils.data import DataLoader
 class FlowDecomposition:
     def __init__(self, input_dim, proj_dim, n_components, 
                  num_delays=None, delay_step=None, subtract_autocorr=False, 
-                 device="cuda", optimizer="Adam", learning_rate=0.01, random_state=None):
+                 device="cuda", optimizer="SGD", learning_rate=0.01, random_state=None):
+        """
+        Initialize the FlowDecomposition model.
 
+        Args:
+            input_dim (int): Dimension of the input time series.
+            proj_dim (int): Projection dimension.
+            n_components (int): Number of components.
+            num_delays (Optional[int]): Number of delays.
+            delay_step (Optional[int]): Delay step.
+            subtract_autocorr (bool): Whether to subtract autocorrelation.
+            device (str): Device to run on ("cuda" or "cpu").
+            optimizer (str): Optimizer name (e.g. "SGD").
+            learning_rate (float): Learning rate for optimizer.
+            random_state (Optional[int]): Random state for reproducibility.
+        """
         self.device = device
         self.random_state = random_state
         self.proj_dim = proj_dim
@@ -34,17 +48,33 @@ class FlowDecomposition:
             num_rand_samples=32, 
             batch_size=1,
             beta=0,
-            pred_policy="range", 
+            optim_policy="range", 
             mask_size=None):
-        
+        """
+        Fit the model using the provided data.
+
+        Args:
+            X (Tensor or np.ndarray): Input data.
+            sample_size (int): Sample size for dataset.
+            library_size (int): Library (subset) size for dataset.
+            exclusion_rad (int, optional): Exclusion radius.
+            theta (Optional[float], optional): Parameter for local weights.
+            time_intv (int, optional): Time interval.
+            num_epochs (int, optional): Number of training epochs.
+            num_rand_samples (int, optional): Number of random samples.
+            batch_size (int, optional): Size of the batch (<= num_rand_samples).
+            beta (float, optional): Projection regularization coefficient.
+            optim_policy (str, optional): Policy for optimization ("fixed" or "range").
+            mask_size (Optional[int], optional): Mask size for selecting dimensions.
+        """
         X_tensor = torch.tensor(X_tensor,requires_grad=True, device=self.device, dtype=torch.float32)
 
-        if pred_policy == "fixed":
+        if optim_policy == "fixed":
             tp_range = (time_intv, time_intv)
-        elif pred_policy == "range":
+        elif optim_policy == "range":
             tp_range = (1, time_intv)
         else:
-            raise ValueError(f"Unknown pred_policy: {pred_policy}")
+            raise ValueError(f"Unknown optim_policy: {optim_policy}")
         
         dataset = RandomSampleSubsetPairDataset(
                     X=X_tensor,
@@ -109,7 +139,7 @@ class FlowDecomposition:
             X (numpy.ndarray): Input data.
         
         Returns:
-            numpy.ndarray: Predicted outputs.
+            numpy.ndarray: Decomposed outputs.
         """
         with torch.no_grad():
             inputs = torch.tensor(X, dtype=torch.float32,device=self.device)
