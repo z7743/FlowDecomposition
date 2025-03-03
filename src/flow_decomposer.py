@@ -42,14 +42,17 @@ class FlowDecomposition:
             sample_size, 
             library_size, 
             exclusion_rad=0,
-            theta=None, 
+            method="nrst_nbrs",
+            theta=None,
+            nbrs_num=None,
             time_intv=1, 
             num_epochs=100, 
             num_rand_samples=32, 
             batch_size=1,
             beta=0,
             optim_policy="range", 
-            mask_size=None):
+            mask_size=None,
+        ):
         """
         Fit the model using the provided data.
 
@@ -58,7 +61,6 @@ class FlowDecomposition:
             sample_size (int): Sample size for dataset.
             library_size (int): Library (subset) size for dataset.
             exclusion_rad (int, optional): Exclusion radius.
-            theta (Optional[float], optional): Parameter for local weights.
             time_intv (int, optional): Time interval.
             num_epochs (int, optional): Number of training epochs.
             num_rand_samples (int, optional): Number of random samples.
@@ -66,6 +68,10 @@ class FlowDecomposition:
             beta (float, optional): Projection regularization coefficient.
             optim_policy (str, optional): Policy for optimization ("fixed" or "range").
             mask_size (Optional[int], optional): Mask size for selecting dimensions.
+            theta (Optional[float], optional): Parameter for local weights.
+            method (str): Method to compute prediction ("nrst_nbrs" or "smap").
+            theta (Optional[float]): Local weighting parameter (required if method="smap").
+            nbrs_num (Optional[int]): Number of nearest neighbors (required if method="nrst_nbrs").
         """
         X_tensor = torch.tensor(X_tensor,requires_grad=True, device=self.device, dtype=torch.float32)
 
@@ -110,7 +116,7 @@ class FlowDecomposition:
 
                 loss = self.__compute_loss(subset_idx, sample_idx,
                                       sample_X_z, sample_y_z, subset_X_z, subset_y_z, 
-                                      theta, exclusion_rad, mask_size)
+                                      method, theta, nbrs_num, exclusion_rad, mask_size)
                 
                 loss /= num_rand_samples
                 ccm_loss += loss.sum()
@@ -157,7 +163,9 @@ class FlowDecomposition:
 
         return h_norm
 
-    def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad, mask_size):
+    def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y,
+                   method, theta=None, nbrs_num=None, exclusion_rad=0, mask_size=None):
+ 
         dim = self.n_comp
 
         if mask_size is not None:
@@ -168,11 +176,28 @@ class FlowDecomposition:
             subset_y = subset_y[:,:,:,rand_idx]
 
             dim = mask_size
-
-        ccm = (self.__get_ccm_matrix_approx(subset_idx, 
-                                            sample_idx, 
-                                            sample_X, sample_y, 
-                                            subset_X, subset_y, theta, exclusion_rad))
+        
+        if method == "smap":
+            if theta is None:
+                raise ValueError("`theta` must be provided when using the 'smap' method.")
+            ccm = self.__get_smap_ccm_matrix_approx(
+                subset_idx, sample_idx, 
+                sample_X, sample_y, 
+                subset_X, subset_y, 
+                theta, exclusion_rad
+            )
+        elif method == "nrst_nbrs":
+            if nbrs_num is None:
+                raise ValueError("`nbrs_num` must be provided when using the 'nrst_nbrs' method.")
+            ccm = self.__get_knn_ccm_matrix_approx(
+                subset_idx, sample_idx, 
+                sample_X, sample_y, 
+                subset_X, subset_y, 
+                nbrs_num, exclusion_rad
+            )
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        
         #Shape: (B, E, dim, dim)
         mask = torch.eye(dim,dtype=bool,device=self.device)
 
@@ -191,8 +216,36 @@ class FlowDecomposition:
             else:
                 score = 1 + (-ccm[:,:,0,0]).mean(axis=1)
             return score
+
+    def __get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
+        batch_size, sample_size, dim_x, n_comp = sample_X.shape
+        _, subset_size, _, _ = subset_X.shape
+        _, _, dim_y, _ = sample_y.shape
+
+        sample_X_t = sample_X.permute(0, 3, 1, 2)
+        subset_X_t = subset_X.permute(0, 3, 1, 2)
+        subset_y_t = subset_y.permute(0, 3, 1, 2)
         
-    def __get_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
+        indices = self.__get_nbrs_indices(subset_X_t,sample_X_t, nbrs_num, subset_idx, sample_idx, exclusion_rad)
+        # Shape: [batch, n_comp, sample_size, nbrs_num]
+
+        batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1, 1, 1)
+        # Shape: [batch, 1, 1, 1]
+
+        selected = subset_y[batch_idx, indices, :, :]
+        # [batch, n_comp, sample_size, nbrs_num, dim_y, n_comp]
+
+        result = selected.permute(0, 2, 4, 3, 1, 5)
+        # [batch, sample_size, dim_y, nbrs_num, n_comp, n_comp]
+        A = result.mean(dim=3)
+        # [batch, num_points, dim, n_comp, n_comp]
+
+        B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
+        
+        r_AB = self.__get_batch_corr(A,B)
+        return r_AB
+    
+    def __get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
         _, _, dim_y, _ = sample_y.shape
@@ -253,6 +306,18 @@ class FlowDecomposition:
             weights = weights * exclusion_matrix[:,None]
         
         return weights
+    
+    def __get_nbrs_indices(self, lib, sublib, n_nbrs, subset_idx, sample_idx, exclusion_rad):
+        #[batch, comp, points, proj_dim]
+        dist = torch.cdist(sublib,lib)
+        exclusion_matrix = torch.where(
+            torch.abs(subset_idx.unsqueeze(-2) - sample_idx.unsqueeze(-1)) > exclusion_rad,
+            0,
+            float('inf')
+        ).unsqueeze(1)
+        dist += exclusion_matrix
+        indices = torch.topk(dist, n_nbrs, largest=False)[1]
+        return indices
     
     def __get_autoreg_matrix_approx(self, A, B):
         batch_size, _, _, _ = A.shape
