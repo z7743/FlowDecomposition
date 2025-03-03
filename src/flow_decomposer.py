@@ -11,77 +11,79 @@ class FlowDecomposition:
                  device="cuda", optimizer="Adam", learning_rate=0.01, random_state=None):
 
         self.device = device
-        
-        self.model = LinearModel(input_dim, proj_dim, n_components, device, random_state)
-
-        self.num_delays = num_delays
-        self.delay_step = delay_step
+        self.random_state = random_state
         self.proj_dim = proj_dim
         self.n_comp = n_components
-        self.random_state = random_state
-
-        self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
+        self.num_delays = num_delays
+        self.delay_step = delay_step
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
 
-        if (num_delays is None) or (delay_step is None) or (num_delays == 0) or (delay_step == 0):
-            self.use_delay = False
-        else:
-            self.use_delay = True
+        self.model = LinearModel(input_dim, proj_dim, n_components, device, random_state)
+        self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
 
-    def fit(self, X, 
+        self.use_delay = bool(num_delays) and bool(delay_step)
+
+    def fit(self, X_tensor, 
             sample_size, 
             library_size, 
             exclusion_rad=0,
             theta=None, 
             time_intv=1, 
             num_epochs=100, 
-            num_batches=32, 
+            num_rand_samples=32, 
+            batch_size=1,
             beta=0,
             pred_policy="range", 
             mask_size=None):
         
-        X = torch.tensor(X,requires_grad=True, device=self.device, dtype=torch.float32)
+        X_tensor = torch.tensor(X_tensor,requires_grad=True, device=self.device, dtype=torch.float32)
 
         if pred_policy == "fixed":
-            dataset = RandomSampleSubsetPairDataset(X=X, sample_size = sample_size,
-                                                    subset_size = library_size, E = self.num_delays, tau=self.delay_step,
-                                                    num_batches = num_batches, tp_range=(time_intv, time_intv),
-                                                   device=self.device,random_state=self.random_state)
+            tp_range = (time_intv, time_intv)
         elif pred_policy == "range":
-            dataset = RandomSampleSubsetPairDataset(X=X, sample_size = sample_size,
-                                                    subset_size = library_size, E = self.num_delays, tau=self.delay_step,
-                                                    num_batches = num_batches, tp_range=(1, time_intv),
-                                                   device=self.device,random_state=self.random_state)
+            tp_range = (1, time_intv)
         else:
-            pass #TODO: pass an exception
+            raise ValueError(f"Unknown pred_policy: {pred_policy}")
+        
+        dataset = RandomSampleSubsetPairDataset(
+                    X=X_tensor,
+                    sample_size=sample_size,
+                    subset_size=library_size,
+                    E=self.num_delays,
+                    tau=self.delay_step,
+                    num_batches=num_rand_samples,
+                    tp_range=tp_range,
+                    device=self.device,
+                    random_state=self.random_state,
+                )
 
-        dataloader = DataLoader(dataset, batch_size=1, pin_memory=False)
+        dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=False)
 
         for epoch in range(num_epochs):
             self.optimizer.zero_grad()
 
             ccm_loss = 0
             for subset_idx, sample_idx, subset_X, subset_y, sample_X, sample_y in dataloader:
-                #Shape: [1, subset/sample size, E, data_dim]
-                subset_X_z = self.model(subset_X[0])
-                sample_X_z = self.model(sample_X[0])
-                subset_y_z = self.model(subset_y[0])
-                sample_y_z = self.model(sample_y[0])
-                #Shape: [subset/sample size, E, proj_dim, n_components]
+                #Shape: [batch, subset/sample size, E, data_dim]
+                subset_X_z = self.model(subset_X)
+                sample_X_z = self.model(sample_X)
+                subset_y_z = self.model(subset_y)
+                sample_y_z = self.model(sample_y)
+                #Shape: [batch, subset/sample size, E, proj_dim, n_components]
 
-                subset_X_z = subset_X_z.reshape(subset_X_z.size(0), -1, subset_X_z.size(3))
-                sample_X_z = sample_X_z.reshape(sample_X_z.size(0), -1, sample_X_z.size(3))
-                subset_y_z = subset_y_z.reshape(subset_y_z.size(0), -1, subset_y_z.size(3))
-                sample_y_z = sample_y_z.reshape(sample_y_z.size(0), -1, sample_y_z.size(3))
-                #Shape: [subset/sample size, E * proj_dim, n_components]
+                subset_X_z = subset_X_z.reshape(subset_X_z.size(0),subset_X_z.size(1), -1, subset_X_z.size(4))
+                sample_X_z = sample_X_z.reshape(sample_X_z.size(0),sample_X_z.size(1), -1, sample_X_z.size(4))
+                subset_y_z = subset_y_z.reshape(subset_y_z.size(0),subset_y_z.size(1), -1, subset_y_z.size(4))
+                sample_y_z = sample_y_z.reshape(sample_y_z.size(0),sample_y_z.size(1), -1, sample_y_z.size(4))
+                #Shape: [batch, subset/sample size, E * proj_dim, n_components]
 
                 loss = self.__compute_loss(subset_idx, sample_idx,
                                       sample_X_z, sample_y_z, subset_X_z, subset_y_z, 
                                       theta, exclusion_rad, mask_size)
-
-                loss /= num_batches
-                ccm_loss += loss
+                
+                loss /= num_rand_samples
+                ccm_loss += loss.sum()
 
             h_norm = self.__compute_h_norm()
             
@@ -91,8 +93,13 @@ class FlowDecomposition:
 
             self.optimizer.step()
 
-            print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss.item():.4f}, ccm_loss: {ccm_loss.item():.4f}, h_norm_loss: {h_norm.item():.4f}')
-            self.loss_history += [total_loss.item()]
+            print(
+                f"Epoch {epoch + 1}/{num_epochs}, "
+                f"Loss: {total_loss.item():.4f}, "
+                f"ccm_loss: {ccm_loss.item():.4f}, "
+                f"h_norm_loss: {h_norm.item():.4f}"
+            )
+            self.loss_history.append(total_loss.item())
 
     def predict(self, X):
         """
@@ -125,10 +132,10 @@ class FlowDecomposition:
 
         if mask_size is not None:
             rand_idx = torch.argsort(torch.rand(dim),device=self.device)[:mask_size]
-            sample_X = sample_X[:,:,rand_idx]
-            sample_y = sample_y[:,:,rand_idx]
-            subset_X = subset_X[:,:,rand_idx]
-            subset_y = subset_y[:,:,rand_idx]
+            sample_X = sample_X[:,:,:,rand_idx]
+            sample_y = sample_y[:,:,:,rand_idx]
+            subset_X = subset_X[:,:,:,rand_idx]
+            subset_y = subset_y[:,:,:,rand_idx]
 
             dim = mask_size
 
@@ -136,7 +143,7 @@ class FlowDecomposition:
                                             sample_idx, 
                                             sample_X, sample_y, 
                                             subset_X, subset_y, theta, exclusion_rad))
-        
+        #Shape: (B, E, dim, dim)
         mask = torch.eye(dim,dtype=bool,device=self.device)
 
         ccm = ccm**2
@@ -144,42 +151,43 @@ class FlowDecomposition:
         if self.subtract_autocorr:
             corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))**2
             if dim > 1:
-                score = 1 + torch.abs(ccm[:,~mask]).mean() - (ccm[:,mask]).mean() + (corr[:,mask]).mean()
+                score = 1 + torch.abs(ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
             else:
-                score = 1 + (-ccm[:,0,0] + corr[:,0,0]).mean()
+                score = 1 + (-ccm[:,:,0,0] + corr[:,:,0,0]).mean(axis=1)
             return score
         else:
             if dim > 1:
-                score = 1 + torch.abs(ccm[:,~mask]).mean() - (ccm[:,mask]).mean() 
+                score = 1 + torch.abs(ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) 
             else:
-                score = 1 + (-ccm[:,0,0]).mean()
+                score = 1 + (-ccm[:,:,0,0]).mean(axis=1)
             return score
         
     def __get_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
-        dim = self.n_comp
-        if self.use_delay:
-            E_x = self.proj_dim * self.num_delays
-            E_y = self.proj_dim * self.num_delays
-        else:
-            E_x = self.proj_dim
-            E_y = self.proj_dim
-        sample_size = sample_X.shape[0]
-        subset_size = subset_X.shape[0]
+        batch_size, sample_size, dim_x, n_comp = sample_X.shape
+        _, subset_size, _, _ = subset_X.shape
+        _, _, dim_y, _ = sample_y.shape
 
-        sample_X_t = sample_X.permute(2, 0, 1)
-        subset_X_t = subset_X.permute(2, 0, 1)
-        subset_y_t = subset_y.permute(2, 0, 1)
+        sample_X_t = sample_X.permute(0, 3, 1, 2)
+        subset_X_t = subset_X.permute(0, 3, 1, 2)
+        subset_y_t = subset_y.permute(0, 3, 1, 2)
+        #Shape: [batch, comp, points, proj_dim]
         
         weights = self.__get_local_weights(subset_X_t,sample_X_t,subset_idx, sample_idx, exclusion_rad, theta)
-        W = weights.unsqueeze(1).expand(dim, dim, sample_size, subset_size).reshape(dim * dim * sample_size, subset_size, 1)
+        #Shape: [batch, comp, sample_size, subset_size]
+        W = (weights.unsqueeze(2)
+             .expand(batch_size, n_comp, n_comp, sample_size, subset_size)
+             .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, 1))
+        #Shape: [batch * comp * comp, subset_size, 1]
 
-        X = subset_X_t.unsqueeze(1).unsqueeze(1).expand(dim, dim, sample_size, subset_size, E_x)
-        X = X.reshape(dim * dim * sample_size, subset_size, E_x)
+        X = (subset_X_t.unsqueeze(2).unsqueeze(2)
+             .expand(batch_size, n_comp, n_comp, sample_size, subset_size, dim_x)
+             .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, dim_x))
 
-        Y = subset_y_t.unsqueeze(1).unsqueeze(0).expand(dim, dim, sample_size, subset_size, E_y)
-        Y = Y.reshape(dim * dim * sample_size, subset_size, E_y)
+        Y = (subset_y_t.unsqueeze(2).unsqueeze(1)
+             .expand(batch_size, n_comp, n_comp, sample_size, subset_size, dim_y)
+             .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, dim_y))
 
-        X_intercept = torch.cat([torch.ones((dim * dim * sample_size, subset_size, 1),device=self.device), X], dim=2)
+        X_intercept = torch.cat([torch.ones((batch_size * n_comp * n_comp * sample_size, subset_size, 1),device=self.device), X], dim=2)
         
         X_intercept_weighted = X_intercept * W
         Y_weighted = Y * W
@@ -188,53 +196,55 @@ class FlowDecomposition:
         XTWy = torch.bmm(X_intercept_weighted.transpose(1, 2), Y_weighted)
         beta = torch.bmm(torch.pinverse(XTWX), XTWy)
 
-        X_ = sample_X_t.unsqueeze(1).expand(dim, dim, sample_size, E_x)
-        X_ = X_.reshape(dim * dim * sample_size, E_x)
-        X_ = torch.cat([torch.ones((dim * dim * sample_size, 1),device=self.device), X_], dim=1)
-        X_ = X_.reshape(dim * dim * sample_size, 1, E_x+1)
+        X_ = (sample_X_t.unsqueeze(2)
+              .expand(batch_size, n_comp, n_comp, sample_size, dim_x)
+              .reshape(batch_size * n_comp * n_comp * sample_size, dim_x))
+        X_ = torch.cat([torch.ones((batch_size * n_comp * n_comp * sample_size, 1),device=self.device), X_], dim=1)
+        X_ = X_.reshape(batch_size * n_comp * n_comp * sample_size, 1, dim_x+1)
         
-        A = torch.bmm(X_, beta).reshape(dim, dim, sample_size, E_y)
-        A = torch.permute(A,(2,3,1,0))
+        A = torch.bmm(X_, beta).reshape(batch_size, n_comp, n_comp, sample_size, dim_y)
+        A = torch.permute(A,(0,3,4,2,1))
 
-        B = sample_y.unsqueeze(-1).expand(sample_size, E_y, dim, dim)
-        #TODO: test whether B = sample_y.unsqueeze(-2).expand(sample_size, E_y, dim, dim)
+        B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
         
         r_AB = self.__get_batch_corr(A,B)
         return r_AB
     
     def __get_local_weights(self, lib, sublib, subset_idx, sample_idx, exclusion_rad, theta):
+        #[batch, comp, points, proj_dim]
         dist = torch.cdist(sublib,lib)
         if theta == None:
             weights = torch.exp(-(dist))
         else:
-            weights = torch.exp(-(theta*dist/dist.mean(axis=2)[:,:,None]))
+            weights = torch.exp(-(theta*dist/(dist.mean(dim=3, keepdim=True) + 1e-6)))
 
         if exclusion_rad > 0:
-            exclusion_matrix = (torch.abs(subset_idx - sample_idx.T) > exclusion_rad)
-            weights = weights * exclusion_matrix
+            exclusion_matrix = (torch.abs(subset_idx.unsqueeze(-2) - sample_idx.unsqueeze(-1)) > exclusion_rad)
+            weights = weights * exclusion_matrix[:,None]
         
         return weights
     
     def __get_autoreg_matrix_approx(self, A, B):
+        batch_size, _, _, _ = A.shape
         dim = self.n_comp
         if self.use_delay:
             E = self.proj_dim * self.num_delays
         else:
             E = self.proj_dim
         
-        A = A[:,:,None,:].expand(-1, E, dim, dim)
-        B = B[:,:,:,None].expand(-1, E, dim, dim)
+        A = A[:,:,:,None,:].expand(batch_size,-1, E, dim, dim)
+        B = B[:,:,:,:,None].expand(batch_size,-1, E, dim, dim)
 
         r_AB = self.__get_batch_corr(A,B)
         return r_AB
     
     def __get_batch_corr(self, A, B):
-        mean_A = torch.mean(A,axis=0)
-        mean_B = torch.mean(B,axis=0)
+        mean_A = torch.mean(A,axis=1).unsqueeze(1)
+        mean_B = torch.mean(B,axis=1).unsqueeze(1)
         
-        sum_AB = torch.sum((A - mean_A[None,:,:]) * (B - mean_B[None,:,:]),axis=0)
-        sum_AA = torch.sum((A - mean_A[None,:,:]) ** 2,axis=0)
-        sum_BB = torch.sum((B - mean_B[None,:,:]) ** 2,axis=0)
+        sum_AB = torch.sum((A - mean_A) * (B - mean_B),axis=1)
+        sum_AA = torch.sum((A - mean_A) ** 2,axis=1)
+        sum_BB = torch.sum((B - mean_B) ** 2,axis=1)
         
         r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
         return r_AB    
