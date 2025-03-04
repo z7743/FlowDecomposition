@@ -167,7 +167,7 @@ class FlowDecomposition:
         dim = self.n_comp
 
         if mask_size is not None:
-            rand_idx = torch.argsort(torch.rand(dim),device=self.device)[:mask_size]
+            rand_idx = torch.argsort(torch.rand(dim,device=self.device))[:mask_size]
             sample_X = sample_X[:,:,:,rand_idx]
             sample_y = sample_y[:,:,:,rand_idx]
             subset_X = subset_X[:,:,:,rand_idx]
