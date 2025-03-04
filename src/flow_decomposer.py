@@ -224,9 +224,8 @@ class FlowDecomposition:
 
         sample_X_t = sample_X.permute(0, 3, 1, 2)
         subset_X_t = subset_X.permute(0, 3, 1, 2)
-        subset_y_t = subset_y.permute(0, 3, 1, 2)
         
-        indices = self.__get_nbrs_indices(subset_X_t,sample_X_t, nbrs_num, subset_idx, sample_idx, exclusion_rad)
+        weights, indices = self.__get_nbrs_indices(subset_X_t,sample_X_t, nbrs_num, subset_idx, sample_idx, exclusion_rad)
         # Shape: [batch, n_comp, sample_size, nbrs_num]
 
         batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1, 1, 1)
@@ -237,7 +236,11 @@ class FlowDecomposition:
 
         result = selected.permute(0, 2, 4, 3, 1, 5)
         # [batch, sample_size, dim_y, nbrs_num, n_comp, n_comp]
-        A = result.mean(dim=3)
+        # Start with weights of shape: [B, n_comp, sample_size, nbrs_num]
+        w = weights.permute(0, 2, 3, 1)  # Now shape: [B, sample_size, nbrs_num, n_comp]
+        w = w.unsqueeze(2).unsqueeze(-1) # Final shape: [B, sample_size, 1, nbrs_num, n_comp, 1]
+
+        A = (result * w).sum(dim=3) 
         # [batch, num_points, dim, n_comp, n_comp]
 
         B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
@@ -309,15 +312,24 @@ class FlowDecomposition:
     
     def __get_nbrs_indices(self, lib, sublib, n_nbrs, subset_idx, sample_idx, exclusion_rad):
         #[batch, comp, points, proj_dim]
+        eps = 1e-6
         dist = torch.cdist(sublib,lib)
         exclusion_matrix = torch.where(
             torch.abs(subset_idx.unsqueeze(-2) - sample_idx.unsqueeze(-1)) > exclusion_rad,
             0,
             float('inf')
         ).unsqueeze(1)
-        dist += exclusion_matrix
-        indices = torch.topk(dist, n_nbrs, largest=False)[1]
-        return indices
+        dist = dist + exclusion_matrix
+
+        near_dist, indices = torch.topk(dist, n_nbrs, largest=False)
+
+        # Calculate weights
+        near_dist_0 = near_dist[:, :, :, 0][:, :, :, None]
+        near_dist_0[near_dist_0 < eps] = eps
+        weights = torch.exp(-near_dist / near_dist_0)
+        weights = weights / weights.sum(dim=3, keepdim=True)
+
+        return weights, indices
     
     def __get_autoreg_matrix_approx(self, A, B):
         batch_size, _, _, _ = A.shape
