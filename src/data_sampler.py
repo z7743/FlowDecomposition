@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import Dataset
+import time
 
 class RandomSampleSubsetPairDataset(Dataset):
     """
@@ -85,12 +86,20 @@ class RandomSampleSubsetPairDataset(Dataset):
             return gen
         return None
     
-    def _sample_candidates(self, num, generator):
+    def _sample_candidates_depricated(self, num, generator):
         """Samples 'num' indices from the valid range using torch.randperm."""
         if generator is not None:
             return torch.randperm(self.valid_range, device=self.device, generator=generator)[:num]
         return torch.randperm(self.valid_range, device=self.device)[:num]
     
+    def _sample_candidates(self, num, generator=None):
+        return torch.randint(
+            high=self.valid_range,
+            size=(num,),
+            device=self.device,
+            generator=generator
+        )
+
     def _get_delay_embedding(self, base_indices):
         """
         Constructs delay embeddings for a set of base indices.
@@ -111,16 +120,15 @@ class RandomSampleSubsetPairDataset(Dataset):
         shift = int(self.tp_range[idx % len(self.tp_range)].item())
         
         # Sample indices for the sample and subset sets.
-        sample_candidates = self._sample_candidates(self.sample_size, local_gen)
         subset_candidates = self._sample_candidates(self.sample_size + self.subset_size, local_gen)
-        # Ensure that subset_candidates are disjoint from sample_candidates.
-        mask = ~(subset_candidates.unsqueeze(0) == sample_candidates.unsqueeze(1)).any(dim=0)
-        subset_candidates = subset_candidates[mask][:self.subset_size]
+        sample_candidates = subset_candidates[self.subset_size:]
+        subset_candidates = subset_candidates[:self.subset_size]
         
         if self.use_delay:
             # Adjust base indices by adding the offset.
             sample_base = sample_candidates + self.offset
             subset_base = subset_candidates + self.offset
+
             sample_indices = self._get_delay_embedding(sample_base)
             subset_indices = self._get_delay_embedding(subset_base)
         else:
@@ -134,9 +142,46 @@ class RandomSampleSubsetPairDataset(Dataset):
         sample_indices = sample_indices.T
         subset_indices = subset_indices.T
         # Retrieve the corresponding data from X and shifted targets from y.
+        #st = time.time()
         X_sample = self.X[sample_indices]
         X_subset = self.X[subset_indices]
         y_sample = self.y[sample_indices + shift]
         y_subset = self.y[subset_indices + shift]
+        #print("ss",time.time()-st)
+        return subset_base, sample_base, X_subset, y_subset, X_sample, y_sample
+
+    def __getitem1__(self, idx):
+        local_gen = self._get_local_generator(idx)
+        # Select the time shift (cycling through tp_range).
+        shift = int(self.tp_range[idx % len(self.tp_range)].item())
+        
+        # Sample indices for the sample and subset sets.
+        #sample_candidates = self._sample_candidates(self.sample_size, local_gen)
+        #subset_candidates = self._sample_candidates(self.sample_size + self.subset_size, local_gen)
+        # Ensure that subset_candidates are disjoint from sample_candidates.
+        #mask = ~(subset_candidates.unsqueeze(0) == sample_candidates.unsqueeze(1)).any(dim=0)
+
+        idx_candidates = self._sample_candidates(self.sample_size + self.subset_size, local_gen)
+        
+        if self.use_delay:
+            # Adjust base indices by adding the offset.
+            indices = self._get_delay_embedding(idx_candidates + self.offset)
+        else:
+            indices = idx_candidates.unsqueeze(0)
+
+        indices = indices.T
+        # Retrieve the corresponding data from X and shifted targets from y.
+        st = time.time()
+        X_sample = self.X[indices]
+        y_sample = self.y[indices + shift]
+
+        X_subset = X_sample[:self.subset_size]
+        y_subset = y_sample[:self.subset_size]
+        X_sample = X_sample[self.subset_size:]
+        y_sample = y_sample[self.subset_size:]
+
+        subset_base = idx_candidates[:self.subset_size]
+        sample_base = idx_candidates[self.subset_size:]
+        print("ss", time.time()-st)
         
         return subset_base, sample_base, X_subset, y_subset, X_sample, y_sample

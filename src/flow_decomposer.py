@@ -4,6 +4,7 @@ from data_sampler import RandomSampleSubsetPairDataset
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import time
 
 class FlowDecomposition:
     def __init__(self, input_dim, proj_dim, n_components, 
@@ -73,7 +74,7 @@ class FlowDecomposition:
             theta (Optional[float]): Local weighting parameter (required if method="smap").
             nbrs_num (Optional[int]): Number of nearest neighbors (required if method="nrst_nbrs").
         """
-        X_tensor = torch.tensor(X_tensor,requires_grad=True, device=self.device, dtype=torch.float32)
+        X_tensor = torch.tensor(X_tensor,requires_grad=False, device=self.device, dtype=torch.float32)
 
         if optim_policy == "fixed":
             tp_range = (time_intv, time_intv)
@@ -94,7 +95,7 @@ class FlowDecomposition:
                     random_state=self.random_state,
                 )
 
-        dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=False)
+        dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=False, num_workers=0)
 
         for epoch in range(num_epochs):
             self.optimizer.zero_grad()
@@ -113,7 +114,6 @@ class FlowDecomposition:
                 subset_y_z = subset_y_z.reshape(subset_y_z.size(0),subset_y_z.size(1), -1, subset_y_z.size(4))
                 sample_y_z = sample_y_z.reshape(sample_y_z.size(0),sample_y_z.size(1), -1, sample_y_z.size(4))
                 #Shape: [batch, subset/sample size, E * proj_dim, n_components]
-
                 loss = self.__compute_loss(subset_idx, sample_idx,
                                       sample_X_z, sample_y_z, subset_X_z, subset_y_z, 
                                       method, theta, nbrs_num, exclusion_rad, mask_size)
@@ -124,9 +124,7 @@ class FlowDecomposition:
             h_norm = self.__compute_h_norm()
             
             total_loss = ccm_loss + beta * h_norm
-
             total_loss.backward()
-
             self.optimizer.step()
 
             print(
