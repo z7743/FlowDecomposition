@@ -43,7 +43,7 @@ class FlowDecomposition:
             sample_size, 
             library_size, 
             exclusion_rad=0,
-            method="nrst_nbrs",
+            method="knn",
             theta=None,
             nbrs_num=None,
             time_intv=1, 
@@ -70,9 +70,9 @@ class FlowDecomposition:
             optim_policy (str, optional): Policy for optimization ("fixed" or "range").
             mask_size (Optional[int], optional): Mask size for selecting dimensions.
             theta (Optional[float], optional): Parameter for local weights.
-            method (str): Method to compute prediction ("nrst_nbrs" or "smap").
+            method (str): Method to compute prediction ("knn" or "smap").
             theta (Optional[float]): Local weighting parameter (required if method="smap").
-            nbrs_num (Optional[int]): Number of nearest neighbors (required if method="nrst_nbrs").
+            nbrs_num (Optional[int]): Number of nearest neighbors (required if method="knn").
         """
         X_tensor = torch.tensor(X_tensor,requires_grad=False, device=self.device, dtype=torch.float32)
 
@@ -99,7 +99,7 @@ class FlowDecomposition:
 
         for epoch in range(num_epochs):
             self.optimizer.zero_grad()
-
+            
             ccm_loss = 0
             for subset_idx, sample_idx, subset_X, subset_y, sample_X, sample_y in dataloader:
                 #Shape: [batch, subset/sample size, E, data_dim]
@@ -184,7 +184,7 @@ class FlowDecomposition:
                 subset_X, subset_y, 
                 theta, exclusion_rad
             )
-        elif method == "nrst_nbrs":
+        elif method == "knn":
             if nbrs_num is None:
                 raise ValueError("`nbrs_num` must be provided when using the 'nrst_nbrs' method.")
             ccm = self.__get_knn_ccm_matrix_approx(
@@ -232,7 +232,7 @@ class FlowDecomposition:
         selected = subset_y[batch_idx, indices, :, :]
         # [batch, n_comp, sample_size, nbrs_num, dim_y, n_comp]
 
-        result = selected.permute(0, 2, 4, 3, 1, 5)
+        result = selected.permute(0, 2, 4, 3, 5, 1)
         # [batch, sample_size, dim_y, nbrs_num, n_comp, n_comp]
         # Start with weights of shape: [B, n_comp, sample_size, nbrs_num]
         w = weights.permute(0, 2, 3, 1)  # Now shape: [B, sample_size, nbrs_num, n_comp]
@@ -258,36 +258,40 @@ class FlowDecomposition:
         
         weights = self.__get_local_weights(subset_X_t,sample_X_t,subset_idx, sample_idx, exclusion_rad, theta)
         #Shape: [batch, comp, sample_size, subset_size]
-        W = (weights.unsqueeze(2)
+        W = (weights.unsqueeze(1)
              .expand(batch_size, n_comp, n_comp, sample_size, subset_size)
              .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, 1))
-        #Shape: [batch * comp * comp, subset_size, 1]
+        #Shape: [batch * {comp} * comp * sample_size, subset_size, 1]
 
-        X = (subset_X_t.unsqueeze(2).unsqueeze(2)
+        X = (subset_X_t.unsqueeze(2).unsqueeze(1)
              .expand(batch_size, n_comp, n_comp, sample_size, subset_size, dim_x)
              .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, dim_x))
+        #Shape: [batch * {comp} * comp * {sample_size}, subset_size, dim_x]
 
-        Y = (subset_y_t.unsqueeze(2).unsqueeze(1)
+        Y = (subset_y_t.unsqueeze(2).unsqueeze(2)
              .expand(batch_size, n_comp, n_comp, sample_size, subset_size, dim_y)
              .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, dim_y))
+        #Shape: [batch * comp * {comp} * {sample_size}, subset_size, dim_y]
 
         X_intercept = torch.cat([torch.ones((batch_size * n_comp * n_comp * sample_size, subset_size, 1),device=self.device), X], dim=2)
-        
+        #Shape: [batch * comp * comp * sample_size, subset_size, dim_x + 1]
+
         X_intercept_weighted = X_intercept * W
         Y_weighted = Y * W
 
         XTWX = torch.bmm(X_intercept_weighted.transpose(1, 2), X_intercept_weighted)
         XTWy = torch.bmm(X_intercept_weighted.transpose(1, 2), Y_weighted)
-        beta = torch.bmm(torch.pinverse(XTWX), XTWy)
+        beta = torch.bmm(torch.inverse(XTWX), XTWy)
+        #Shape: [batch * comp{y} * comp{x} * sample_size, dim_x + 1, dim_y]
 
-        X_ = (sample_X_t.unsqueeze(2)
+        X_ = (sample_X_t.unsqueeze(1)
               .expand(batch_size, n_comp, n_comp, sample_size, dim_x)
               .reshape(batch_size * n_comp * n_comp * sample_size, dim_x))
         X_ = torch.cat([torch.ones((batch_size * n_comp * n_comp * sample_size, 1),device=self.device), X_], dim=1)
         X_ = X_.reshape(batch_size * n_comp * n_comp * sample_size, 1, dim_x+1)
         
         A = torch.bmm(X_, beta).reshape(batch_size, n_comp, n_comp, sample_size, dim_y)
-        A = torch.permute(A,(0,3,4,2,1))
+        A = torch.permute(A,(0,3,4,1,2))
 
         B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
         
