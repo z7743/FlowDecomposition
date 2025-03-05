@@ -334,8 +334,7 @@ class FlowDecomposition:
         return weights, indices
     
     def __get_autoreg_matrix_approx(self, A, B):
-        batch_size, _, _, _ = A.shape
-        dim = self.n_comp
+        batch_size, _, _, dim = A.shape
         if self.use_delay:
             E = self.proj_dim * self.num_delays
         else:
