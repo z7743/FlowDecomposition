@@ -4,9 +4,8 @@ from data_sampler import RandomSampleSubsetPairDataset
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import time
 
-DATA_DTYPE = torch.float16
+DATA_DTYPE = torch.float32
 MODEL_DTYPE = torch.float32
 
 class FlowDecomposition:

@@ -2,7 +2,6 @@ import torch
 from torch.utils.data import Dataset
 import time
 
-
 class RandomSampleSubsetPairDataset_depricated(Dataset):
     """
     Dataset that samples two disjoint sets of indices from a multivariate time series (or point cloud)
