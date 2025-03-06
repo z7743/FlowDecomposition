@@ -1,4 +1,4 @@
-from model import LinearModel
+from model import LinearModel, NonlinearModel
 from data_sampler import RandomSampleSubsetPairDataset
 
 import torch
@@ -6,10 +6,13 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import time
 
+DATA_DTYPE = torch.float16
+MODEL_DTYPE = torch.float32
+
 class FlowDecomposition:
     def __init__(self, input_dim, proj_dim, n_components, 
-                 num_delays=None, delay_step=None, subtract_autocorr=False, 
-                 device="cuda", optimizer="SGD", learning_rate=0.01, random_state=None):
+                 num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
+                 device="cuda",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None):
         """
         Initialize the FlowDecomposition model.
 
@@ -17,15 +20,18 @@ class FlowDecomposition:
             input_dim (int): Dimension of the input time series.
             proj_dim (int): Projection dimension.
             n_components (int): Number of components.
+            model (str): Projection type ("linear" or "nonlinear").
             num_delays (Optional[int]): Number of delays.
             delay_step (Optional[int]): Delay step.
             subtract_autocorr (bool): Whether to subtract autocorrelation.
             device (str): Device to run on ("cuda" or "cpu").
-            optimizer (str): Optimizer name (e.g. "SGD").
+            data_device (str): Device to store data on ("cuda" or "cpu").
+            optimizer (str): Optimizer name (e.g. "Adagrad").
             learning_rate (float): Learning rate for optimizer.
             random_state (Optional[int]): Random state for reproducibility.
         """
         self.device = device
+        self.data_device = data_device
         self.random_state = random_state
         self.proj_dim = proj_dim
         self.n_comp = n_components
@@ -34,7 +40,15 @@ class FlowDecomposition:
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
 
-        self.model = LinearModel(input_dim, proj_dim, n_components, device, random_state)
+        if model == "linear":
+            self.model = LinearModel(input_dim, proj_dim, n_components, 
+                                     device=device, dtype=MODEL_DTYPE, random_state=random_state)
+        elif model == "nonlinear":
+            self.model = NonlinearModel(input_dim, proj_dim, n_components, 
+                                        device=device, dtype=MODEL_DTYPE, random_state=random_state)
+        else:
+            raise ValueError(f"Unknown model: {model}")
+        
         self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
 
         self.use_delay = bool(num_delays) and bool(delay_step)
@@ -74,7 +88,7 @@ class FlowDecomposition:
             theta (Optional[float]): Local weighting parameter (required if method="smap").
             nbrs_num (Optional[int]): Number of nearest neighbors (required if method="knn").
         """
-        X_tensor = torch.tensor(X_tensor,requires_grad=False, device=self.device, dtype=torch.float32)
+        X_tensor = torch.tensor(X_tensor, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
 
         if optim_policy == "fixed":
             tp_range = (time_intv, time_intv)
@@ -83,16 +97,19 @@ class FlowDecomposition:
         else:
             raise ValueError(f"Unknown optim_policy: {optim_policy}")
         
+        if mask_size is not None and mask_size >= self.n_comp:
+            mask_size = None
+        
         dataset = RandomSampleSubsetPairDataset(
-                    X=X_tensor,
-                    sample_size=sample_size,
-                    subset_size=library_size,
-                    E=self.num_delays,
-                    tau=self.delay_step,
-                    num_batches=num_rand_samples,
-                    tp_range=tp_range,
-                    device=self.device,
-                    random_state=self.random_state,
+                    X = X_tensor,
+                    sample_size = sample_size,
+                    subset_size = library_size,
+                    E = self.num_delays,
+                    tau = self.delay_step,
+                    num_batches = num_rand_samples,
+                    tp_range = tp_range,
+                    device = self.data_device,
+                    random_state = self.random_state,
                 )
 
         dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=False, num_workers=0)
@@ -102,7 +119,14 @@ class FlowDecomposition:
             
             ccm_loss = 0
             for subset_idx, sample_idx, subset_X, subset_y, sample_X, sample_y in dataloader:
+                subset_idx = subset_idx.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+                sample_idx = sample_idx.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+                subset_X = subset_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+                subset_y = subset_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+                sample_X = sample_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+                sample_y = sample_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
                 #Shape: [batch, subset/sample size, E, data_dim]
+
                 subset_X_z = self.model(subset_X)
                 sample_X_z = self.model(sample_X)
                 subset_y_z = self.model(subset_y)
@@ -135,7 +159,7 @@ class FlowDecomposition:
             )
             self.loss_history.append(total_loss.item())
 
-    def predict(self, X):
+    def predict(self, X, device="cpu"):
         """
         Calculates embeddings using the trained model.
         
@@ -146,20 +170,9 @@ class FlowDecomposition:
             numpy.ndarray: Decomposed outputs.
         """
         with torch.no_grad():
-            inputs = torch.tensor(X, dtype=torch.float32,device=self.device)
-            outputs = torch.permute(self.model(inputs),dims=(0,2,1)) #Easier to interpret
+            inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
+            outputs = torch.permute(self.model.to(device)(inputs),dims=(0,2,1)) #Easier to interpret
         return outputs.cpu().numpy()
-
-    def __compute_h_norm(self):
-        l1 = sum(p.abs().sum() 
-                for p in self.model.parameters() if p.requires_grad)
-        l2 = sum(p.norm(2)
-                for p in self.model.parameters() if p.requires_grad)
-        num_w = torch.tensor(sum(p.numel()
-                for p in self.model.parameters() if p.requires_grad),dtype=torch.float32)
-        h_norm = 1-(torch.sqrt(num_w) - (l1 / (l2 + 1e-6))) / (torch.sqrt(num_w) - 1)
-
-        return h_norm
 
     def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y,
                    method, theta=None, nbrs_num=None, exclusion_rad=0, mask_size=None):
@@ -214,6 +227,17 @@ class FlowDecomposition:
             else:
                 score = 1 + (-ccm[:,:,0,0]).mean(axis=1)
             return score
+        
+    def __compute_h_norm(self):
+        l1 = sum(p.abs().sum() 
+                for p in self.model.parameters() if p.requires_grad)
+        l2 = sum(p.norm(2)
+                for p in self.model.parameters() if p.requires_grad)
+        num_w = torch.tensor(sum(p.numel()
+                for p in self.model.parameters() if p.requires_grad),dtype=MODEL_DTYPE)
+        h_norm = 1-(torch.sqrt(num_w) - (l1 / (l2 + 1e-6))) / (torch.sqrt(num_w) - 1)
+
+        return h_norm
 
     def __get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape

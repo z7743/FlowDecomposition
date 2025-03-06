@@ -2,7 +2,8 @@ import torch
 from torch.utils.data import Dataset
 import time
 
-class RandomSampleSubsetPairDataset(Dataset):
+
+class RandomSampleSubsetPairDataset_depricated(Dataset):
     """
     Dataset that samples two disjoint sets of indices from a multivariate time series (or point cloud)
     and returns their corresponding data along with shifted target values.
@@ -41,8 +42,8 @@ class RandomSampleSubsetPairDataset(Dataset):
             random_state (int, optional): Seed for reproducibility; if provided, ensures consistent random sampling for each index.
         """
         self.device = device
-        self.X = X.to(device)
-        self.y = y.to(device) if y is not None else self.X
+        self.X = X
+        self.y = y if y is not None else self.X
         self.sample_size = sample_size
         self.subset_size = subset_size
         self.num_batches = num_batches
@@ -184,4 +185,150 @@ class RandomSampleSubsetPairDataset(Dataset):
         sample_base = idx_candidates[self.subset_size:]
         print("ss", time.time()-st)
         
+        return subset_base, sample_base, X_subset, y_subset, X_sample, y_sample
+    
+
+class RandomSampleSubsetPairDataset(Dataset):
+    """
+    Dataset that samples two disjoint sets of indices from a multivariate time series (or point cloud)
+    and returns their corresponding data along with shifted target values.
+
+    For each __getitem__ call:
+      - A time shift is selected from a generated tp_range (cycling through its values).
+      - Two independent random sets of indices are drawn from a valid range.
+      - Any overlap between the "sample" and "subset" indices is removed.
+
+    Delay embedding is applied if delay parameters are provided and not equal to (E, tau) = (1, 0). 
+    """
+    def __init__(
+        self,
+        X,
+        sample_size,
+        subset_size,
+        y = None,
+        num_batches = 32,
+        tp_range = (1, 2),
+        device = "cpu", 
+        E = None,
+        tau = None,
+        random_state = None,
+    ):
+        """
+        Parameters:
+            X (torch.Tensor): Input data tensor of shape [num_datapoints, ...].
+            sample_size (int): Number of indices to sample for the "sample" set.
+            subset_size (int): Number of indices to sample for the "subset" set.
+            num_batches (int): Number of random batches to produce.
+            tp_range (tuple): (tp_min, tp_max) specifying the time-shift range.
+            device (str): The device to which *sliced* mini-batches should be moved.
+            y (torch.Tensor, optional): Target tensor; if not provided, uses X as target.
+            E (int, optional): Embedding dimension (number of delays).
+            tau (int, optional): Time delay between consecutive elements in the embedding.
+            random_state (int, optional): Seed for reproducibility.
+        """
+        super().__init__()
+        
+        self.device = device         # the device we eventually want to move slices to
+
+        self.X = X.to(device)
+        if y is None:
+            self.y = X.to(device)
+        else:
+            self.y = y.to(device)
+        
+        self.sample_size = sample_size
+        self.subset_size = subset_size
+        self.num_batches = num_batches
+        self.num_datapoints = self.X.shape[0]
+        self.random_state = random_state
+
+        if isinstance(tp_range, (list, tuple)) and len(tp_range) == 2:
+            tp_min, tp_max = tp_range
+            # Store time shifts on CPU or data_device so it doesn't matter:
+            self.tp_range = torch.linspace(tp_min, tp_max + (1 - 1e-5), num_batches, device=self.device).to(torch.int)
+        else:
+            raise ValueError("tp_range must be a tuple of two numbers (tp_min, tp_max).")
+        self.tp_max = int(self.tp_range.max().item())
+
+        # Determine whether delay embedding should be used.
+        if (E is None) or (tau is None) or (E == 0) or (tau == 0):
+            self.use_delay = False
+            self.E = 1
+            self.tau = 0
+            self.offset = 0
+        else:
+            self.use_delay = True
+            self.E = E
+            self.tau = tau
+            self.offset = (self.E - 1) * self.tau
+
+        # Compute the valid range for sampling base indices.
+        self.valid_range = self.num_datapoints - self.tp_max - self.offset
+        if self.valid_range < (sample_size + subset_size):
+            raise ValueError(
+                "Not enough valid data points given sample_size, subset_size, "
+                "tp_range, and delay parameters."
+            )
+
+    def __len__(self):
+        return self.num_batches
+
+    def _get_local_generator(self, idx):
+        if self.random_state is not None:
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(self.random_state + idx)
+            return gen
+        return None
+
+    def _sample_candidates(self, num, generator=None):
+        return torch.randint(
+            high=self.valid_range,
+            size=(num,),
+            device=self.device,
+            generator=generator
+        )
+
+    def _get_delay_embedding(self, base_indices: torch.Tensor):
+        """
+        Constructs delay embeddings for a set of base indices.
+        Returns shape [E, N], each col is b - [E-1, ..., 0]*tau
+        """
+        delays = self.tau * torch.arange(self.E - 1, -1, -1, device=self.device)
+        return base_indices.unsqueeze(0) - delays.unsqueeze(1)
+    
+    def __getitem__(self, idx):
+        # Local random generator
+        local_gen = self._get_local_generator(idx)
+
+        # 1) time shift
+        shift = int(self.tp_range[idx % len(self.tp_range)].item())
+
+        # 2) sample random indices
+        subset_candidates = self._sample_candidates(self.sample_size + self.subset_size, local_gen)
+        sample_candidates = subset_candidates[self.subset_size:]
+        subset_candidates = subset_candidates[:self.subset_size]
+
+        if self.use_delay:
+            sample_base = sample_candidates + self.offset
+            subset_base = subset_candidates + self.offset
+            sample_indices = self._get_delay_embedding(sample_base)
+            subset_indices = self._get_delay_embedding(subset_base)
+        else:
+            sample_base = sample_candidates
+            subset_base = subset_candidates
+
+            # Without delays, shape [1, N]
+            sample_indices = sample_candidates.unsqueeze(0)
+            subset_indices = subset_candidates.unsqueeze(0)
+
+        # Convert from [E, N] -> [N, E]
+        sample_indices = sample_indices.T
+        subset_indices = subset_indices.T
+
+        # 3) Slice from the big dataset (on self.data_device)...
+        X_subset = self.X[subset_indices] 
+        X_sample = self.X[sample_indices]
+        y_subset = self.y[subset_indices + shift]
+        y_sample = self.y[sample_indices + shift]
+
         return subset_base, sample_base, X_subset, y_subset, X_sample, y_sample
