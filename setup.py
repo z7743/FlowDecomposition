@@ -16,9 +16,15 @@ setup(
     url="", 
     packages=find_packages(where="src"),
     package_dir={"": "src"},               
+    include_package_data=True,
     python_requires=">=3.9",              
     install_requires=[ 
         "numpy",
         "pandas",
+        "torch",
+    ],
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "Operating System :: OS Independent",
     ],
 )

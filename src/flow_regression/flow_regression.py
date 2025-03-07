@@ -34,12 +34,6 @@ class FlowRegression:
         else:
             raise ValueError(f"Unknown model: {model}")
         
-        #self.weight_model = torch.nn.Sequential(nn.Linear(embed_dim,embed_dim,bias=True),
-        #                                        #nn.GELU(),
-        #                                        nn.Linear(embed_dim,1,bias=True),
-        #                                        nn.Sigmoid()).to(device)
-
-        
         self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
         self.use_delay = bool(num_delays) and bool(delay_step)
 
@@ -146,7 +140,7 @@ class FlowRegression:
         """
         with torch.no_grad():
             inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
-            outputs = torch.permute(self.model.to(device)(inputs),dims=(0,2,1)) #Easier to interpret
+            outputs = self.model.to(device)(inputs)[:,:,0] 
         return outputs.cpu().numpy()
     
     def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y,
@@ -157,7 +151,7 @@ class FlowRegression:
         if method == "smap":
             if theta is None:
                 raise ValueError("`theta` must be provided when using the 'smap' method.")
-            ccm = self.__get_smap_ccm_matrix_approx(
+            ccm = self._get_smap_ccm_matrix_approx(
                 subset_idx, sample_idx, 
                 sample_X, sample_y, 
                 subset_X, subset_y, 
@@ -166,7 +160,7 @@ class FlowRegression:
         elif method == "knn":
             if nbrs_num is None:
                 raise ValueError("`nbrs_num` must be provided when using the 'nrst_nbrs' method.")
-            ccm = self.__get_knn_ccm_matrix_approx(
+            ccm = self._get_knn_ccm_matrix_approx(
                 subset_idx, sample_idx, 
                 sample_X, sample_y, 
                 subset_X, subset_y, 
@@ -199,7 +193,13 @@ class FlowRegression:
 
         return h_norm
 
-    def __get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
+    def _get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
+        A, B = self._get_knn_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad)
+        
+        r_AB = self.__get_batch_corr(A,B)
+        return r_AB
+    
+    def _get_knn_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
         _, _, dim_y, _ = sample_y.shape
@@ -226,11 +226,16 @@ class FlowRegression:
         # [batch, num_points, dim, n_comp, n_comp]
 
         B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
+
+        return A, B
+    
+    def _get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
+        A, B = self._get_smap_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad)
         
         r_AB = self.__get_batch_corr(A,B)
         return r_AB
     
-    def __get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
+    def _get_smap_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
         _, _, dim_y, _ = sample_y.shape
@@ -279,8 +284,7 @@ class FlowRegression:
 
         B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
         
-        r_AB = self.__get_batch_corr(A,B)
-        return r_AB
+        return A, B
     
     def __get_local_weights(self, lib, sublib, subset_idx, sample_idx, exclusion_rad, theta):
         #[batch, comp, points, proj_dim]
@@ -340,5 +344,4 @@ class FlowRegression:
         
         r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
         return r_AB    
-    
 
