@@ -89,8 +89,9 @@ class WeightedFlowRegression(FlowRegression):
         with torch.no_grad():
             inputs = torch.tensor(X, dtype=MODEL_DTYPE, device=device)
             outputs = self.model.to(device)(inputs)[:, :, 0]
-            outputs = get_td_embedding_torch(outputs, self.num_delays, self.delay_step)
-            outputs = outputs.reshape(outputs.size(0), -1)
+            if self.use_delay:
+                outputs = get_td_embedding_torch(outputs, self.num_delays, self.delay_step)
+                outputs = outputs.reshape(outputs.size(0), -1)
             outputs = self.weight_model(outputs)
             
             # Pad outputs with NaNs at the beginning if pad_nan is True.
