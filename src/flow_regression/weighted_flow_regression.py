@@ -94,7 +94,7 @@ class WeightedFlowRegression(FlowRegression):
             outputs = self.weight_model(outputs)
             
             # Pad outputs with NaNs at the beginning if pad_nan is True.
-            if pad_nan:
+            if pad_nan and self.use_delay:
                 pad_length = X.shape[0] - outputs.shape[0]
                 if pad_length > 0:
                     nan_pad = torch.full((pad_length, outputs.shape[1]),
