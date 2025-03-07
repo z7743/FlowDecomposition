@@ -92,7 +92,7 @@ class WeightedFlowRegression(FlowRegression):
             if self.use_delay:
                 outputs = get_td_embedding_torch(outputs, self.num_delays, self.delay_step)
                 outputs = outputs.reshape(outputs.size(0), -1)
-            outputs = self.weight_model(outputs)
+            outputs = self.weight_model.to(device)(outputs)
             
             # Pad outputs with NaNs at the beginning if pad_nan is True.
             if pad_nan and self.use_delay:
