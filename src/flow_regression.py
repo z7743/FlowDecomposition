@@ -8,51 +8,42 @@ from torch.utils.data import DataLoader
 DATA_DTYPE = torch.float32
 MODEL_DTYPE = torch.float32
 
-class FlowDecomposition:
-    def __init__(self, input_dim, proj_dim, n_components, 
-                 num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
-                 device="cpu",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None):
-        """
-        Initialize the FlowDecomposition model.
+class FlowRegression:
 
+    def __init__(self, input_dim, proj_dim, 
+                 num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
+                 device="cuda",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None):
+        """
+        Initializes the FlowRegression model.
+        
         Args:
-            input_dim (int): Dimension of the input time series.
-            proj_dim (int): Projection dimension.
-            n_components (int): Number of components.
-            model (str): Projection type ("linear" or "nonlinear").
-            num_delays (Optional[int]): Number of delays.
-            delay_step (Optional[int]): Delay step.
-            subtract_autocorr (bool): Whether to subtract autocorrelation.
-            device (str): Device to run on ("cuda" or "cpu").
-            data_device (str): Device to store data on ("cuda" or "cpu").
-            optimizer (str): Optimizer name (e.g. "Adagrad").
-            learning_rate (float): Learning rate for optimizer.
-            random_state (Optional[int]): Random state for reproducibility.
         """
         self.device = device
         self.data_device = data_device
         self.random_state = random_state
         self.proj_dim = proj_dim
-        self.n_comp = n_components
         self.num_delays = num_delays
         self.delay_step = delay_step
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
 
         if model == "linear":
-            self.model = LinearModel(input_dim, proj_dim, n_components, 
-                                     device=device, dtype=MODEL_DTYPE, random_state=random_state)
+            self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device,random_state=random_state)
         elif model == "nonlinear":
-            self.model = NonlinearModel(input_dim, proj_dim, n_components, 
-                                        device=device, dtype=MODEL_DTYPE, random_state=random_state)
+            self.model = NonlinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device,random_state=random_state)
         else:
             raise ValueError(f"Unknown model: {model}")
         
-        self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
+        #self.weight_model = torch.nn.Sequential(nn.Linear(embed_dim,embed_dim,bias=True),
+        #                                        #nn.GELU(),
+        #                                        nn.Linear(embed_dim,1,bias=True),
+        #                                        nn.Sigmoid()).to(device)
 
+        
+        self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
         self.use_delay = bool(num_delays) and bool(delay_step)
 
-    def fit(self, X, 
+    def fit(self, X, Y,
             sample_size, 
             library_size, 
             exclusion_rad=0,
@@ -65,29 +56,16 @@ class FlowDecomposition:
             batch_size=1,
             beta=0,
             optim_policy="range", 
-            mask_size=None,
         ):
+
         """
         Fit the model using the provided data.
 
-        Args:
-            X (Tensor or np.ndarray): Input data.
-            sample_size (int): Sample size for dataset.
-            library_size (int): Library (subset) size for dataset.
-            exclusion_rad (int, optional): Exclusion radius.
-            time_intv (int, optional): Time interval.
-            num_epochs (int, optional): Number of training epochs.
-            num_rand_samples (int, optional): Number of random samples.
-            batch_size (int, optional): Size of the batch (<= num_rand_samples).
-            beta (float, optional): Projection regularization coefficient.
-            optim_policy (str, optional): Policy for optimization ("fixed" or "range").
-            mask_size (Optional[int], optional): Mask size for selecting dimensions.
-            theta (Optional[float], optional): Parameter for local weights.
-            method (str): Method to compute prediction ("knn" or "smap").
-            theta (Optional[float]): Local weighting parameter (required if method="smap").
-            nbrs_num (Optional[int]): Number of nearest neighbors (required if method="knn").
+        Args:"
         """
+
         X_tensor = torch.tensor(X, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
+        Y_tensor = torch.tensor(Y, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
 
         if optim_policy == "fixed":
             tp_range = (time_intv, time_intv)
@@ -95,12 +73,10 @@ class FlowDecomposition:
             tp_range = (1, time_intv)
         else:
             raise ValueError(f"Unknown optim_policy: {optim_policy}")
-        
-        if mask_size is not None and mask_size >= self.n_comp:
-            mask_size = None
-        
+
         dataset = RandomSampleSubsetPairDataset(
                     X = X_tensor,
+                    y = Y_tensor,
                     sample_size = sample_size,
                     subset_size = library_size,
                     E = self.num_delays,
@@ -128,8 +104,8 @@ class FlowDecomposition:
 
                 subset_X_z = self.model(subset_X)
                 sample_X_z = self.model(sample_X)
-                subset_y_z = self.model(subset_y)
-                sample_y_z = self.model(sample_y)
+                subset_y_z = subset_y[:,:,[-1]].unsqueeze(-1)# subset_y.unsqueeze(-1) 
+                sample_y_z = sample_y[:,:,[-1]].unsqueeze(-1)# sample_y.unsqueeze(-1)
                 #Shape: [batch, subset/sample size, E, proj_dim, n_components]
 
                 subset_X_z = subset_X_z.reshape(subset_X_z.size(0),subset_X_z.size(1), -1, subset_X_z.size(4))
@@ -139,7 +115,7 @@ class FlowDecomposition:
                 #Shape: [batch, subset/sample size, E * proj_dim, n_components]
                 loss = self.__compute_loss(subset_idx, sample_idx,
                                       sample_X_z, sample_y_z, subset_X_z, subset_y_z, 
-                                      method, theta, nbrs_num, exclusion_rad, mask_size)
+                                      method, theta, nbrs_num, exclusion_rad)
                 
                 loss /= num_rand_samples
                 ccm_loss += loss.sum()
@@ -172,20 +148,11 @@ class FlowDecomposition:
             inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
             outputs = torch.permute(self.model.to(device)(inputs),dims=(0,2,1)) #Easier to interpret
         return outputs.cpu().numpy()
-
+    
     def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y,
-                   method, theta=None, nbrs_num=None, exclusion_rad=0, mask_size=None):
- 
-        dim = self.n_comp
+                   method, theta=None, nbrs_num=None, exclusion_rad=0):
 
-        if mask_size is not None:
-            rand_idx = torch.argsort(torch.rand(dim,device=self.device))[:mask_size]
-            sample_X = sample_X[:,:,:,rand_idx]
-            sample_y = sample_y[:,:,:,rand_idx]
-            subset_X = subset_X[:,:,:,rand_idx]
-            subset_y = subset_y[:,:,:,rand_idx]
-
-            dim = mask_size
+        dim = 1
         
         if method == "smap":
             if theta is None:
@@ -209,22 +176,16 @@ class FlowDecomposition:
             raise ValueError(f"Unknown method: {method}")
         
         #Shape: (B, E, dim, dim)
-        mask = torch.eye(dim,dtype=bool,device=self.device)
-
-        ccm = ccm**2
+        ccm = ccm.squeeze(-2).squeeze(-1)
 
         if self.subtract_autocorr:
-            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))**2
-            if dim > 1:
-                score = 1 + torch.abs(ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
-            else:
-                score = 1 + (-ccm[:,:,0,0] + corr[:,:,0,0]).mean(axis=1)
+            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))
+            corr = corr.squeeze(-2).squeeze(-1)
+
+            score = 1 + (-(ccm**2) + corr**2).mean(axis=1)
             return score
         else:
-            if dim > 1:
-                score = 1 + torch.abs(ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) 
-            else:
-                score = 1 + (-ccm[:,:,0,0]).mean(axis=1)
+            score = 1 + (-(ccm**2)).mean(axis=1)
             return score
         
     def __compute_h_norm(self):
