@@ -37,98 +37,76 @@ class FlowRegression:
         self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
         self.use_delay = bool(num_delays) and bool(delay_step)
 
-    def fit(self, X, Y,
-            sample_size, 
-            library_size, 
-            exclusion_rad=0,
-            method="knn",
-            theta=None,
-            nbrs_num=None,
-            time_intv=1, 
-            num_epochs=100, 
-            num_rand_samples=32, 
-            batch_size=1,
-            beta=0,
-            optim_policy="range", 
-        ):
 
+    def fit(self, X, Y,
+            sample_size, library_size, exclusion_rad=0, method="knn",
+            theta=None, nbrs_num=None, time_intv=1, 
+            num_epochs=100, num_rand_samples=32, batch_size=1, beta=0,
+            optim_policy="range"):
         """
         Fit the model using the provided data.
-
-        Args:"
         """
-
-        X_tensor = torch.tensor(X, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
-        Y_tensor = torch.tensor(Y, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
-
-        if optim_policy == "fixed":
-            tp_range = (time_intv, time_intv)
-        elif optim_policy == "range":
-            tp_range = (1, time_intv)
-        else:
-            raise ValueError(f"Unknown optim_policy: {optim_policy}")
-
-        dataset = RandomSampleSubsetPairDataset(
-                    X = X_tensor,
-                    y = Y_tensor,
-                    sample_size = sample_size,
-                    subset_size = library_size,
-                    E = self.num_delays,
-                    tau = self.delay_step,
-                    num_batches = num_rand_samples,
-                    tp_range = tp_range,
-                    device = self.data_device,
-                    random_state = self.random_state,
-                )
-
-        dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=False, num_workers=0)
-
+        dataloader = self._create_dataloader(
+            X, Y,
+            sample_size=sample_size,
+            library_size=library_size,
+            time_intv=time_intv,
+            num_rand_samples=num_rand_samples,
+            optim_policy=optim_policy,
+            batch_size=batch_size
+        )
+        
         for epoch in range(num_epochs):
             self.optimizer.zero_grad()
             
-            ccm_loss = 0
-            for subset_idx, sample_idx, subset_X, subset_y, sample_X, sample_y in dataloader:
-                subset_idx = subset_idx.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-                sample_idx = sample_idx.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-                subset_X = subset_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-                subset_y = subset_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-                sample_X = sample_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-                sample_y = sample_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-                #Shape: [batch, subset/sample size, E, data_dim]
-
-                subset_X_z = self.model(subset_X)
-                sample_X_z = self.model(sample_X)
-                subset_y_z = subset_y[:,:,[-1]].unsqueeze(-1)# subset_y.unsqueeze(-1) 
-                sample_y_z = sample_y[:,:,[-1]].unsqueeze(-1)# sample_y.unsqueeze(-1)
-                #Shape: [batch, subset/sample size, E, proj_dim, n_components]
-
-                subset_X_z = subset_X_z.reshape(subset_X_z.size(0),subset_X_z.size(1), -1, subset_X_z.size(4))
-                sample_X_z = sample_X_z.reshape(sample_X_z.size(0),sample_X_z.size(1), -1, sample_X_z.size(4))
-                subset_y_z = subset_y_z.reshape(subset_y_z.size(0),subset_y_z.size(1), -1, subset_y_z.size(4))
-                sample_y_z = sample_y_z.reshape(sample_y_z.size(0),sample_y_z.size(1), -1, sample_y_z.size(4))
-                #Shape: [batch, subset/sample size, E * proj_dim, n_components]
-                loss = self.__compute_loss(subset_idx, sample_idx,
-                                      sample_X_z, sample_y_z, subset_X_z, subset_y_z, 
-                                      method, theta, nbrs_num, exclusion_rad)
-                
-                loss /= num_rand_samples
-                ccm_loss += loss.sum()
-
-            h_norm = self.__compute_h_norm()
+            ccm_loss = self._compute_loss_from_dataloader(
+                dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad
+            )
             
-            total_loss = ccm_loss + beta * h_norm
+            h_norm_val = self.__compute_h_norm()
+            total_loss = ccm_loss + beta * h_norm_val
+
+            # Backprop and update
             total_loss.backward()
             self.optimizer.step()
 
             print(
                 f"Epoch {epoch + 1}/{num_epochs}, "
-                f"Loss: {total_loss.item():.4f}, "
-                f"ccm_loss: {ccm_loss.item():.4f}, "
-                f"h_norm_loss: {h_norm.item():.4f}"
+                f"CCM Loss: {ccm_loss.item():.4f}, "
+                f"h_norm: {h_norm_val.item():.4f}, "
+                f"Total Loss: {total_loss.item():.4f}"
             )
             self.loss_history.append(total_loss.item())
 
-    def predict(self, X, device="cpu"):
+    def evaluate_loss(self, X_test, Y_test,
+                      sample_size, library_size, exclusion_rad=0, method="knn",
+                      theta=None, nbrs_num=None, time_intv=1, 
+                      num_rand_samples=32, batch_size=1, beta=0,
+                      optim_policy="range"):
+        """
+        Compute only the raw CCM loss on a test set (no h_norm added).
+        
+        Returns:
+            float: The total CCM loss on the test dataset.
+        """
+        with torch.no_grad():
+            # Create dataloader for test data
+            dataloader = self._create_dataloader(
+                X_test, Y_test,
+                sample_size=sample_size,
+                library_size=library_size,
+                time_intv=time_intv,
+                num_rand_samples=num_rand_samples,
+                optim_policy=optim_policy,
+                batch_size=batch_size
+            )
+
+            ccm_loss = self._compute_loss_from_dataloader(
+                dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad
+            )
+        return ccm_loss.item()
+
+    def transform(self, X, device="cpu"):
         """
         Calculates embeddings using the trained model.
         
@@ -142,12 +120,89 @@ class FlowRegression:
             inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
             outputs = self.model.to(device)(inputs)[:,:,0] 
         return outputs.cpu().numpy()
+
+    def _create_dataloader(self, X, Y, sample_size, library_size,
+                           time_intv, num_rand_samples, optim_policy, batch_size):
+        """
+        Creates a DataLoader for the given dataset and parameters.
+        """
+        if optim_policy == "fixed":
+            tp_range = (time_intv, time_intv)
+        elif optim_policy == "range":
+            tp_range = (0, time_intv)
+        else:
+            raise ValueError(f"Unknown optim_policy: {optim_policy}")
+
+        X_tensor = torch.tensor(X, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
+        Y_tensor = torch.tensor(Y, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
+
+        dataset = RandomSampleSubsetPairDataset(
+            X=X_tensor,
+            y=Y_tensor,
+            sample_size=sample_size,
+            subset_size=library_size,
+            E=self.num_delays,
+            tau=self.delay_step,
+            num_batches=num_rand_samples,
+            tp_range=tp_range,
+            device=self.data_device,
+            random_state=self.random_state,
+        )
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            pin_memory=False,
+            num_workers=0
+        )
+        return dataloader
+
+    def _compute_loss_from_dataloader(self, dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad):
+        """
+        Computes only the CCM-based loss (no h_norm added) over the batches.
+        """
+        total_loss = 0.0
+        for subset_idx, sample_idx, subset_X, subset_y, sample_X, sample_y in dataloader:
+            # Move tensors to the appropriate device and type.
+            subset_idx = subset_idx.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            sample_idx = sample_idx.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            subset_X = subset_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            subset_y = subset_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            sample_X = sample_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            sample_y = sample_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            
+            # Compute embeddings for the subset and sample
+            subset_X_z = self.model(subset_X)
+            sample_X_z = self.model(sample_X)
+            
+            # Use the last element of y as in the fit method.
+            subset_y_z = subset_y[:, :, [-1]].unsqueeze(-1)
+            sample_y_z = sample_y[:, :, [-1]].unsqueeze(-1)
+            
+            # Reshape to match expected dimensions:
+            subset_X_z = subset_X_z.reshape(subset_X_z.size(0), subset_X_z.size(1), -1, subset_X_z.size(4))
+            sample_X_z = sample_X_z.reshape(sample_X_z.size(0), sample_X_z.size(1), -1, sample_X_z.size(4))
+            subset_y_z = subset_y_z.reshape(subset_y_z.size(0), subset_y_z.size(1), -1, subset_y_z.size(4))
+            sample_y_z = sample_y_z.reshape(sample_y_z.size(0), sample_y_z.size(1), -1, sample_y_z.size(4))
+            
+            # Compute the CCM-based loss for this batch.
+            loss = self.__compute_loss(
+                subset_idx, sample_idx,
+                sample_X_z, sample_y_z,
+                subset_X_z, subset_y_z,
+                method, theta, nbrs_num, exclusion_rad
+            )
+            # Divide by num_rand_samples to average across random draws
+            loss /= num_rand_samples
+            total_loss += loss.sum()
+        
+        return total_loss
     
     def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y,
-                   method, theta=None, nbrs_num=None, exclusion_rad=0):
-
-        dim = 1
-        
+                       method, theta=None, nbrs_num=None, exclusion_rad=0):
+        """
+        Internal method computing the correlation-based loss for a given batch.
+        """
         if method == "smap":
             if theta is None:
                 raise ValueError("`theta` must be provided when using the 'smap' method.")
@@ -159,7 +214,7 @@ class FlowRegression:
             )
         elif method == "knn":
             if nbrs_num is None:
-                raise ValueError("`nbrs_num` must be provided when using the 'nrst_nbrs' method.")
+                raise ValueError("`nbrs_num` must be provided when using the 'knn' method.")
             ccm = self._get_knn_ccm_matrix_approx(
                 subset_idx, sample_idx, 
                 sample_X, sample_y, 
@@ -169,17 +224,17 @@ class FlowRegression:
         else:
             raise ValueError(f"Unknown method: {method}")
         
-        #Shape: (B, E, dim, dim)
+        # ccm has shape: (B, E, dim, dim)
         ccm = ccm.squeeze(-2).squeeze(-1)
 
+        # Possibly subtract auto-correlation
         if self.subtract_autocorr:
-            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))
+            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X, sample_y))
             corr = corr.squeeze(-2).squeeze(-1)
-
-            score = 1 + (-(ccm**2) + corr**2).mean(axis=1)
+            score = 1 + (-(ccm) + corr).mean(axis=1)
             return score
         else:
-            score = 1 + (-(ccm**2)).mean(axis=1)
+            score = 1 + (-(ccm)).mean(axis=1)
             return score
         
     def __compute_h_norm(self):
