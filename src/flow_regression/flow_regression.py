@@ -81,10 +81,13 @@ class FlowRegression:
     def evaluate_loss(self, X_test, Y_test,
                       sample_size, library_size, exclusion_rad=0, method="knn",
                       theta=None, nbrs_num=None, time_intv=1, 
-                      num_rand_samples=32, batch_size=1, beta=0,
+                      num_epochs=None, num_rand_samples=32, batch_size=1, beta=None,
                       optim_policy="range"):
         """
-        Compute only the raw CCM loss on a test set (no h_norm added).
+        Computes only the raw CCM loss on a test set. Importantly, this method does not 
+        calculate predictions based on the training data. Instead, it builds the model using 
+        the test data and calculates the loss as if it were during the training cycle.
+        num_epochs and beta are included for compatibility with the fit method, but are not used.
         
         Returns:
             float: The total CCM loss on the test dataset.

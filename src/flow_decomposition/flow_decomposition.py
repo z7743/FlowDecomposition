@@ -158,7 +158,7 @@ class FlowDecomposition:
             )
             self.loss_history.append(total_loss.item())
 
-    def predict(self, X, device="cpu"):
+    def transform(self, X, device="cpu"):
         """
         Calculates embeddings using the trained model.
         
