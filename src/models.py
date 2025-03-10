@@ -59,11 +59,11 @@ class NonlinearModel(nn.Module):
             torch.manual_seed(random_state)
 
         self.model = nn.Sequential(
-            nn.Linear(input_dim, input_dim, bias=True, device=device, dtype=dtype),
+            nn.Linear(input_dim, proj_dim * n_comp * 2, bias=True, device=device, dtype=dtype),
             nn.GELU(),
-            nn.Linear(input_dim, input_dim, bias=True, device=device, dtype=dtype),
+            nn.Linear(proj_dim * n_comp * 2, proj_dim * n_comp * 2, bias=True, device=device, dtype=dtype),
             nn.GELU(),
-            nn.Linear(input_dim, proj_dim * n_comp, bias=False, device=device, dtype=dtype)
+            nn.Linear(proj_dim * n_comp * 2, proj_dim * n_comp, bias=False, device=device, dtype=dtype)
         )
 
     def forward(self, x):
