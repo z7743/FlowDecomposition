@@ -88,7 +88,7 @@ class FlowRegression:
         calculate predictions based on the training data. Instead, it builds the model using 
         the test data and calculates the loss as if it were during the training cycle.
         num_epochs and beta are included for compatibility with the fit method, but are not used.
-        
+
         Returns:
             float: The total CCM loss on the test dataset.
         """
@@ -162,7 +162,7 @@ class FlowRegression:
 
     def _compute_loss_from_dataloader(self, dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad):
         """
-        Computes only the CCM-based loss (no h_norm added) over the batches.
+        Computes only the CCM-based loss over the batches.
         """
         total_loss = 0.0
         for subset_idx, sample_idx, subset_X, subset_y, sample_X, sample_y in dataloader:
