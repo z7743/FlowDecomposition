@@ -8,9 +8,9 @@ from torch.utils.data import DataLoader
 DATA_DTYPE = torch.float32
 MODEL_DTYPE = torch.float32
 
-class FlowRegression:
+class DecomposedFlowRegression:
 
-    def __init__(self, input_dim, proj_dim, 
+    def __init__(self, input_dim, proj_dim, n_components,
                  num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
                  device="cuda",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None):
         """
@@ -22,20 +22,24 @@ class FlowRegression:
         self.data_device = data_device
         self.random_state = random_state
         self.proj_dim = proj_dim
+        self.n_comp = n_components
         self.num_delays = num_delays
         self.delay_step = delay_step
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
 
         if model == "linear":
-            self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device,random_state=random_state)
+            self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=n_components, device=device,random_state=random_state)
         elif model == "nonlinear":
-            self.model = NonlinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device,random_state=random_state)
+            self.model = NonlinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=n_components, device=device,random_state=random_state)
         else:
             raise ValueError(f"Unknown model: {model}")
         
-        self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
         self.use_delay = bool(num_delays) and bool(delay_step)
+
+
+        self.component_mixing = torch.nn.Sequential(torch.nn.Linear(n_components, 1, bias=False)).to(device)
+        self.optimizer = getattr(optim, optimizer)(list(self.model.parameters()) + list(self.component_mixing.parameters()), lr=learning_rate)
 
 
     def fit(self, X, Y,
@@ -121,7 +125,7 @@ class FlowRegression:
         """
         with torch.no_grad():
             inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
-            outputs = self.model.to(device)(inputs)[:,:,0] 
+            outputs = torch.permute(self.model.to(device)(inputs),dims=(0,2,1))
         return outputs.cpu().numpy()
 
     def _create_dataloader(self, X, Y, sample_size, library_size,
@@ -227,17 +231,29 @@ class FlowRegression:
         else:
             raise ValueError(f"Unknown method: {method}")
         
-        # ccm has shape: (B, E, dim, dim)
-        ccm = ccm.squeeze(-2).squeeze(-1)
+        # ccm has shape: (batch, E_y, n_comp_y, n_comp_x)
+        mask = torch.eye(self.n_comp,dtype=bool,device=self.device)
+        #ccm = torch.abs(ccm)
+        #ccm_r = ccm[:,:,mask]
+        #ccm_R = ccm.clone()
+        #ccm_R[:,:,mask] = 1
 
-        # Possibly subtract auto-correlation
+        #score = ccm_r.unsqueeze(-2) @ torch.inverse(ccm_R) @ ccm_r.unsqueeze(-1)
+        #return 1 - score.mean(axis=(1,2,3))
+
         if self.subtract_autocorr:
-            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X, sample_y))
-            corr = corr.squeeze(-2).squeeze(-1)
-            score = 1 + (-(ccm) + corr).mean(axis=1)
+            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))
+            if self.n_comp > 1:
+                score = 1 + (ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
+            else:
+                score = 1 + (-ccm[:,:,0,0] + corr[:,:,0,0]).mean(axis=1)
             return score
         else:
-            score = 1 + (-(ccm)).mean(axis=1)
+            if self.n_comp > 1:
+                #score = 1 + (ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) 
+                score = 1 + (ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).max(dim=2)[0].mean(axis=1)
+            else:
+                score = 1 + (-ccm[:,:,0,0]).mean(axis=1)
             return score
         
     def __compute_h_norm(self):
@@ -258,32 +274,36 @@ class FlowRegression:
         return r_AB
     
     def _get_knn_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
-        batch_size, sample_size, dim_x, n_comp = sample_X.shape
+        batch_size, sample_size, dim_x, n_comp_x = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
-        _, _, dim_y, _ = sample_y.shape
+        _, _, dim_y, n_comp_y = sample_y.shape
 
         sample_X_t = sample_X.permute(0, 3, 1, 2)
         subset_X_t = subset_X.permute(0, 3, 1, 2)
         
         weights, indices = self.__get_nbrs_indices(subset_X_t,sample_X_t, nbrs_num, subset_idx, sample_idx, exclusion_rad)
-        # Shape: [batch, n_comp, sample_size, nbrs_num]
+        # Shape: [batch, n_comp_x, sample_size, nbrs_num]
 
         batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1, 1, 1)
         # Shape: [batch, 1, 1, 1]
 
         selected = subset_y[batch_idx, indices, :, :]
-        # [batch, n_comp, sample_size, nbrs_num, dim_y, n_comp]
+        # [batch, n_comp_x, sample_size, nbrs_num, dim_y, n_comp_y]
 
         result = selected.permute(0, 2, 4, 3, 5, 1)
-        # [batch, sample_size, dim_y, nbrs_num, n_comp, n_comp]
-        # Start with weights of shape: [B, n_comp, sample_size, nbrs_num]
-        w = weights.permute(0, 2, 3, 1)  # Now shape: [B, sample_size, nbrs_num, n_comp]
-        w = w.unsqueeze(2).unsqueeze(-2) # Final shape: [B, sample_size, 1, nbrs_num, 1,  n_comp]
+        # [batch, sample_size, dim_y, nbrs_num, n_comp_y, n_comp_x]
+        # Start with weights of shape: [batch, n_comp_x, sample_size, nbrs_num]
+        w = weights.permute(0, 2, 3, 1)  # Now shape: [batch, sample_size, nbrs_num, n_comp_x]
+        w = w.unsqueeze(2).unsqueeze(-2) # Final shape: [batch, sample_size, 1, nbrs_num, 1, n_comp_x]
 
         A = (result * w).sum(dim=3) 
-        # [batch, num_points, dim, n_comp, n_comp]
-
-        B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
+        # [batch, num_points, dim_y, n_comp_y, n_comp_x]
+        #A = A.mean(axis=-1).unsqueeze(-1)
+        #A = self.component_mixing(A)
+        A = A.expand(batch_size,sample_size,dim_y, n_comp_x, n_comp_x)
+        B = A.clone().permute(0,1,2,4,3)
+        B[:,:,:,torch.eye(n_comp_x,dtype=bool,device=self.device)] = sample_y
+        #B = sample_y.unsqueeze(-1)#.expand(batch_size, sample_size, dim_y, n_comp_y, n_comp_x)
 
         return A, B
     
@@ -292,11 +312,11 @@ class FlowRegression:
         
         r_AB = self.__get_batch_corr(A,B)
         return r_AB
-    
+
     def _get_smap_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
-        batch_size, sample_size, dim_x, n_comp = sample_X.shape
+        batch_size, sample_size, dim_x, n_comp_x = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
-        _, _, dim_y, _ = sample_y.shape
+        _, _, dim_y, n_comp_y = sample_y.shape
 
         sample_X_t = sample_X.permute(0, 3, 1, 2)
         subset_X_t = subset_X.permute(0, 3, 1, 2)
@@ -304,23 +324,23 @@ class FlowRegression:
         #Shape: [batch, comp, points, proj_dim]
         
         weights = self.__get_local_weights(subset_X_t,sample_X_t,subset_idx, sample_idx, exclusion_rad, theta)
-        #Shape: [batch, comp, sample_size, subset_size]
+        #Shape: [batch, n_comp_x, sample_size, subset_size]
         W = (weights.unsqueeze(1)
-             .expand(batch_size, n_comp, n_comp, sample_size, subset_size)
-             .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, 1))
+             .expand(batch_size, n_comp_y, n_comp_x, sample_size, subset_size)
+             .reshape(batch_size * n_comp_y * n_comp_x * sample_size, subset_size, 1))
         #Shape: [batch * {comp} * comp * sample_size, subset_size, 1]
 
         X = (subset_X_t.unsqueeze(2).unsqueeze(1)
-             .expand(batch_size, n_comp, n_comp, sample_size, subset_size, dim_x)
-             .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, dim_x))
+             .expand(batch_size, n_comp_y, n_comp_x, sample_size, subset_size, dim_x)
+             .reshape(batch_size * n_comp_y * n_comp_x * sample_size, subset_size, dim_x))
         #Shape: [batch * {comp} * comp * {sample_size}, subset_size, dim_x]
 
         Y = (subset_y_t.unsqueeze(2).unsqueeze(2)
-             .expand(batch_size, n_comp, n_comp, sample_size, subset_size, dim_y)
-             .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, dim_y))
+             .expand(batch_size, n_comp_y, n_comp_x, sample_size, subset_size, dim_y)
+             .reshape(batch_size * n_comp_y * n_comp_x * sample_size, subset_size, dim_y))
         #Shape: [batch * comp * {comp} * {sample_size}, subset_size, dim_y]
 
-        X_intercept = torch.cat([torch.ones((batch_size * n_comp * n_comp * sample_size, subset_size, 1),device=self.device), X], dim=2)
+        X_intercept = torch.cat([torch.ones((batch_size * n_comp_y * n_comp_x * sample_size, subset_size, 1),device=self.device), X], dim=2)
         #Shape: [batch * comp * comp * sample_size, subset_size, dim_x + 1]
 
         X_intercept_weighted = X_intercept * W
@@ -332,15 +352,19 @@ class FlowRegression:
         #Shape: [batch * comp{y} * comp{x} * sample_size, dim_x + 1, dim_y]
 
         X_ = (sample_X_t.unsqueeze(1)
-              .expand(batch_size, n_comp, n_comp, sample_size, dim_x)
-              .reshape(batch_size * n_comp * n_comp * sample_size, dim_x))
-        X_ = torch.cat([torch.ones((batch_size * n_comp * n_comp * sample_size, 1),device=self.device), X_], dim=1)
-        X_ = X_.reshape(batch_size * n_comp * n_comp * sample_size, 1, dim_x+1)
+              .expand(batch_size, n_comp_y, n_comp_x, sample_size, dim_x)
+              .reshape(batch_size * n_comp_y * n_comp_x * sample_size, dim_x))
+        X_ = torch.cat([torch.ones((batch_size * n_comp_y * n_comp_x * sample_size, 1),device=self.device), X_], dim=1)
+        X_ = X_.reshape(batch_size * n_comp_y * n_comp_x * sample_size, 1, dim_x+1)
         
-        A = torch.bmm(X_, beta).reshape(batch_size, n_comp, n_comp, sample_size, dim_y)
+        A = torch.bmm(X_, beta).reshape(batch_size, n_comp_y, n_comp_x, sample_size, dim_y)
         A = torch.permute(A,(0,3,4,1,2))
 
-        B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
+        A = A.expand(batch_size,sample_size,dim_y, n_comp_x, n_comp_x)
+        B = A.clone().permute(0,1,2,4,3)
+        B[:,:,:,torch.eye(n_comp_x,dtype=bool,device=self.device)] = sample_y
+
+        #B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp_y, n_comp_x)
         
         return A, B
     

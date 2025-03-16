@@ -294,7 +294,7 @@ class FlowDecomposition:
         # [batch, sample_size, dim_y, nbrs_num, n_comp, n_comp]
         # Start with weights of shape: [B, n_comp, sample_size, nbrs_num]
         w = weights.permute(0, 2, 3, 1)  # Now shape: [B, sample_size, nbrs_num, n_comp]
-        w = w.unsqueeze(2).unsqueeze(-1) # Final shape: [B, sample_size, 1, nbrs_num, n_comp, 1]
+        w = w.unsqueeze(2).unsqueeze(-2) # Final shape: [B, sample_size, 1, nbrs_num, 1, n_comp] #TODO: w.unsqueeze(2).unsqueeze(-1) ?
 
         A = (result * w).sum(dim=3) 
         # [batch, num_points, dim, n_comp, n_comp]
