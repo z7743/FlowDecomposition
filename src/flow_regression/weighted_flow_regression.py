@@ -46,7 +46,7 @@ class WeightedFlowRegression(FlowRegression):
         A, B = super()._get_smap_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad)
         
         batch_size, sample_size, _, _ = sample_X.shape
-        sample_weights = self.weight_model(sample_X[:,:,:,0]).reshape(batch_size,sample_size, 1, 1)
+        sample_weights = self.weight_model(sample_X[:,:,:,0]).reshape(batch_size,sample_size, 1, 1, 1)
         
         r_AB = self.__get_batch_weighted_corr(A,B,sample_weights)
         return r_AB
