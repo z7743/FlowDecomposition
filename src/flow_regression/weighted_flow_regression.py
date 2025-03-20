@@ -1,4 +1,5 @@
 from utils import get_td_embedding_torch
+from models import LinearModel, NonlinearModel
 from .flow_regression import FlowRegression
 
 import torch
@@ -104,3 +105,62 @@ class WeightedFlowRegression(FlowRegression):
                                         device=device)
                     outputs = torch.cat([nan_pad, outputs], dim=0)
         return outputs.cpu().numpy()
+    
+    def save(self, filepath: str):
+        """
+        Saves the model, optimizer state, and other attributes to disk,
+        including the additional weight_model.
+        """
+        # 1) Collect constructor / hyperparams needed to re-initialize
+        init_params = {
+            "input_dim": self.input_dim,
+            "proj_dim": self.proj_dim,
+            "num_delays": self.num_delays,
+            "delay_step": self.delay_step,
+            "model": "linear" if isinstance(self.model, LinearModel) else "nonlinear",
+            "subtract_autocorr": self.subtract_autocorr,
+            "device": self.device,  # might be overridden on load
+            "data_device": self.data_device,
+            "optimizer": type(self.optimizer).__name__,
+            "learning_rate": self.optimizer.param_groups[0]['lr'],
+            "random_state": self.random_state
+        }
+
+        # 2) Create checkpoint dict
+        checkpoint = {
+            "init_params": init_params,
+            "model_state": self.model.state_dict(),
+            "weight_model_state": self.weight_model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "loss_history": self.loss_history,
+        }
+
+        # 3) Save checkpoint
+        torch.save(checkpoint, filepath)
+        print(f"WeightedFlowRegression model saved to {filepath}")
+
+    @classmethod
+    def load(cls, filepath: str, map_location: str = "cpu"):
+        """
+        Loads a saved WeightedFlowRegression model from disk.
+        """
+        # 1) Load checkpoint
+        checkpoint = torch.load(filepath, map_location=map_location)
+        init_params = checkpoint["init_params"]
+
+        # 2) Instantiate a new instance with the stored hyperparams
+        #    Override device/data_device for new session if desired
+        init_params["device"] = map_location
+        init_params["data_device"] = map_location
+        new_instance = cls(**init_params)
+
+        # 3) Load states
+        new_instance.model.load_state_dict(checkpoint["model_state"])
+        new_instance.weight_model.load_state_dict(checkpoint["weight_model_state"])
+        new_instance.optimizer.load_state_dict(checkpoint["optimizer_state"])
+
+        # 4) Restore training history
+        new_instance.loss_history = checkpoint["loss_history"]
+
+        print(f"WeightedFlowRegression model loaded from {filepath}")
+        return new_instance

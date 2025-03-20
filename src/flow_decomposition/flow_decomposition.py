@@ -38,6 +38,7 @@ class FlowDecomposition:
         self.delay_step = delay_step
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
+        self.input_dim = input_dim
 
         if model == "linear":
             self.model = LinearModel(input_dim, proj_dim, n_components, 
@@ -415,4 +416,66 @@ class FlowDecomposition:
         r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
         return r_AB    
     
+    def save(self, filepath: str):
+        """
+        Saves the model, optimizer state, and other attributes to disk.
+        """
+        # 1) Collect constructor / hyperparams needed to re-initialize
+        init_params = {
+            "input_dim": self.input_dim,
+            "proj_dim": self.proj_dim,
+            "n_components": self.n_comp,
+            "num_delays": self.num_delays,
+            "delay_step": self.delay_step,
+            "model": "linear" if isinstance(self.model, LinearModel) else "nonlinear",
+            "subtract_autocorr": self.subtract_autocorr,
+            "device": self.device,       # might be overridden on load
+            "data_device": self.data_device,
+            "optimizer": type(self.optimizer).__name__,
+            "learning_rate": self.optimizer.param_groups[0]['lr'],
+            "random_state": self.random_state
+        }
 
+        # 2) Create checkpoint dictionary
+        checkpoint = {
+            "init_params": init_params,
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "loss_history": self.loss_history,
+        }
+
+        # 3) Save checkpoint
+        torch.save(checkpoint, filepath)
+        print(f"Model saved to {filepath}")
+
+    @classmethod
+    def load(cls, filepath: str, map_location: str = "cpu"):
+        """
+        Loads a saved model from disk.
+        Args:
+            filepath (str): Path to the saved file.
+            map_location (str): Device mapping for the checkpoint (e.g. "cpu" or "cuda").
+        Returns:
+            FlowDecomposition: A new FlowDecomposition instance with loaded state.
+        """
+        # 1) Load checkpoint
+        checkpoint = torch.load(filepath, map_location=map_location)
+        init_params = checkpoint["init_params"]
+
+        # 2) Instantiate a new instance with the stored hyperparams
+        #    Note: we override `device` in init_params so that the new instance
+        #    is created on `map_location`, if desired. 
+        init_params["device"] = map_location
+        init_params["data_device"] = map_location
+
+        new_instance = cls(**init_params)
+
+        # 3) Load model and optimizer states
+        new_instance.model.load_state_dict(checkpoint["model_state"])
+        new_instance.optimizer.load_state_dict(checkpoint["optimizer_state"])
+
+        # 4) Restore any extra info such as training history
+        new_instance.loss_history = checkpoint["loss_history"]
+
+        print(f"Model loaded from {filepath}")
+        return new_instance

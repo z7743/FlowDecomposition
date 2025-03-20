@@ -26,6 +26,7 @@ class FlowRegression:
         self.delay_step = delay_step
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
+        self.input_dim = input_dim
 
         if model == "linear":
             self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device,random_state=random_state)
@@ -403,3 +404,57 @@ class FlowRegression:
         r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
         return r_AB    
 
+    def save(self, filepath: str):
+        """
+        Saves the model, optimizer state, and other attributes to disk.
+        """
+        # 1) Gather constructor params
+        init_params = {
+            "input_dim": self.input_dim,
+            "proj_dim": self.proj_dim,
+            "num_delays": self.num_delays,
+            "delay_step": self.delay_step,
+            "model": "linear" if isinstance(self.model, LinearModel) else "nonlinear",
+            "subtract_autocorr": self.subtract_autocorr,
+            "device": self.device,
+            "data_device": self.data_device,
+            "optimizer": type(self.optimizer).__name__,
+            "learning_rate": self.optimizer.param_groups[0]['lr'],
+            "random_state": self.random_state
+        }
+
+        # 2) Create checkpoint
+        checkpoint = {
+            "init_params": init_params,
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "loss_history": self.loss_history,
+        }
+
+        # 3) Save to disk
+        torch.save(checkpoint, filepath)
+        print(f"FlowRegression model saved to {filepath}")
+
+    @classmethod
+    def load(cls, filepath: str, map_location: str = "cpu"):
+        """
+        Loads a saved FlowRegression model from disk.
+        """
+        # 1) Load checkpoint
+        checkpoint = torch.load(filepath, map_location=map_location)
+        init_params = checkpoint["init_params"]
+
+        # 2) Instantiate new instance
+        init_params["device"] = map_location
+        init_params["data_device"] = map_location
+        new_instance = cls(**init_params)
+
+        # 3) Load model and optimizer states
+        new_instance.model.load_state_dict(checkpoint["model_state"])
+        new_instance.optimizer.load_state_dict(checkpoint["optimizer_state"])
+
+        # 4) Restore additional data
+        new_instance.loss_history = checkpoint["loss_history"]
+
+        print(f"FlowRegression model loaded from {filepath}")
+        return new_instance
