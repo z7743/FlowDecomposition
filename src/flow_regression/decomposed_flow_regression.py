@@ -1,5 +1,5 @@
-from models import LinearModel, NonlinearModel
-from data_samplers import RandomSampleSubsetPairDataset
+from src.models import LinearModel, NonlinearModel
+from src.data_samplers import RandomSampleSubsetPairDataset
 
 import torch
 import torch.optim as optim

@@ -1,5 +1,5 @@
-from utils import get_td_embedding_torch
-from models import LinearModel, NonlinearModel
+from src.utils import get_td_embedding_torch
+from src.models import LinearModel, NonlinearModel
 from .flow_regression import FlowRegression
 
 import torch
