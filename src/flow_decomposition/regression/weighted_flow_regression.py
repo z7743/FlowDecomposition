@@ -1,5 +1,5 @@
-from core.utils import get_td_embedding_torch
-from core.models import LinearModel, NonlinearModel
+from flow_decomposition.utils.utils import get_td_embedding_torch
+from flow_decomposition.utils.models import LinearModel, NonlinearModel
 from .flow_regression import FlowRegression
 
 import torch

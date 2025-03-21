@@ -1,5 +1,5 @@
-from core.models import LinearModel, NonlinearModel
-from core.data_samplers import RandomSampleSubsetPairDataset
+from flow_decomposition.utils.models import LinearModel, NonlinearModel
+from flow_decomposition.utils.data_samplers import RandomSampleSubsetPairDataset
 
 import torch
 import torch.optim as optim
