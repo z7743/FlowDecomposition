@@ -11,7 +11,7 @@ MODEL_DTYPE = torch.float32
 class FlowDecomposition:
     def __init__(self, input_dim, proj_dim, n_components, 
                  num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
-                 device="cpu",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None):
+                 device="cpu",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None, verbose=1):
         """
         Initialize the FlowDecomposition model.
 
@@ -28,6 +28,7 @@ class FlowDecomposition:
             optimizer (str): Optimizer name (e.g. "Adagrad").
             learning_rate (float): Learning rate for optimizer.
             random_state (Optional[int]): Random state for reproducibility.
+            verbose (int): Verbosity flag (1: print epoch info, 0: don't print).
         """
         self.device = device
         self.data_device = data_device
@@ -39,6 +40,7 @@ class FlowDecomposition:
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
         self.input_dim = input_dim
+        self.verbose = verbose
 
         if model == "linear":
             self.model = LinearModel(input_dim, proj_dim, n_components, 
@@ -79,12 +81,13 @@ class FlowDecomposition:
             total_loss.backward()
             self.optimizer.step()
             
-            print(
-                f"Epoch {epoch + 1}/{num_epochs}, "
-                f"Loss: {total_loss.item():.4f}, "
-                f"ccm_loss: {ccm_loss.item():.4f}, "
-                f"h_norm: {h_norm.item():.4f}"
-            )
+            if self.verbose == 1:
+                print(
+                    f"Epoch {epoch + 1}/{num_epochs}, "
+                    f"Loss: {total_loss.item():.4f}, "
+                    f"ccm_loss: {ccm_loss.item():.4f}, "
+                    f"h_norm: {h_norm.item():.4f}"
+                )
             self.loss_history.append(total_loss.item())
 
     def evaluate_loss(self, X_test, 

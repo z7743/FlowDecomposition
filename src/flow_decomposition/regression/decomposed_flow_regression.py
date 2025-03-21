@@ -12,7 +12,7 @@ class DecomposedFlowRegression:
 
     def __init__(self, input_dim, proj_dim, n_components,
                  num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
-                 device="cuda",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None):
+                 device="cuda",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None, verbose=1):
         """
         Initializes the FlowRegression model.
         
@@ -27,6 +27,7 @@ class DecomposedFlowRegression:
         self.delay_step = delay_step
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
+        self.verbose = verbose
 
         if model == "linear":
             self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=n_components, device=device,random_state=random_state)
@@ -74,12 +75,13 @@ class DecomposedFlowRegression:
             total_loss.backward()
             self.optimizer.step()
 
-            print(
-                f"Epoch {epoch + 1}/{num_epochs}, "
-                f"CCM Loss: {ccm_loss.item():.4f}, "
-                f"h_norm: {h_norm_val.item():.4f}, "
-                f"Total Loss: {total_loss.item():.4f}"
-            )
+            if self.verbose == 1:
+                print(
+                    f"Epoch {epoch + 1}/{num_epochs}, "
+                    f"CCM Loss: {ccm_loss.item():.4f}, "
+                    f"h_norm: {h_norm_val.item():.4f}, "
+                    f"Total Loss: {total_loss.item():.4f}"
+                )
             self.loss_history.append(total_loss.item())
 
     def evaluate_loss(self, X_test, Y_test,
