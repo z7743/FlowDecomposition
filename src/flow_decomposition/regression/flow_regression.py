@@ -1,5 +1,5 @@
-from src.models import LinearModel, NonlinearModel
-from src.data_samplers import RandomSampleSubsetPairDataset
+from core.models import LinearModel, NonlinearModel
+from core.data_samplers import RandomSampleSubsetPairDataset
 
 import torch
 import torch.optim as optim
@@ -8,32 +8,20 @@ from torch.utils.data import DataLoader
 DATA_DTYPE = torch.float32
 MODEL_DTYPE = torch.float32
 
-class FlowDecomposition:
-    def __init__(self, input_dim, proj_dim, n_components, 
-                 num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
-                 device="cpu",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None):
-        """
-        Initialize the FlowDecomposition model.
+class FlowRegression:
 
+    def __init__(self, input_dim, proj_dim, 
+                 num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
+                 device="cuda",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None):
+        """
+        Initializes the FlowRegression model.
+        
         Args:
-            input_dim (int): Dimension of the input time series.
-            proj_dim (int): Projection dimension.
-            n_components (int): Number of components.
-            model (str): Projection type ("linear" or "nonlinear").
-            num_delays (Optional[int]): Number of delays.
-            delay_step (Optional[int]): Delay step.
-            subtract_autocorr (bool): Whether to subtract autocorrelation.
-            device (str): Device to run on ("cuda" or "cpu").
-            data_device (str): Device to store data on ("cuda" or "cpu").
-            optimizer (str): Optimizer name (e.g. "Adagrad").
-            learning_rate (float): Learning rate for optimizer.
-            random_state (Optional[int]): Random state for reproducibility.
         """
         self.device = device
         self.data_device = data_device
         self.random_state = random_state
         self.proj_dim = proj_dim
-        self.n_comp = n_components
         self.num_delays = num_delays
         self.delay_step = delay_step
         self.subtract_autocorr = subtract_autocorr
@@ -41,78 +29,85 @@ class FlowDecomposition:
         self.input_dim = input_dim
 
         if model == "linear":
-            self.model = LinearModel(input_dim, proj_dim, n_components, 
-                                     device=device, dtype=MODEL_DTYPE, random_state=random_state)
+            self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device,random_state=random_state)
         elif model == "nonlinear":
-            self.model = NonlinearModel(input_dim, proj_dim, n_components, 
-                                        device=device, dtype=MODEL_DTYPE, random_state=random_state)
+            self.model = NonlinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device,random_state=random_state)
         else:
             raise ValueError(f"Unknown model: {model}")
         
         self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
-
         self.use_delay = bool(num_delays) and bool(delay_step)
 
-    def fit(self, X,
+
+    def fit(self, X, Y,
             sample_size, library_size, exclusion_rad=0, method="knn",
-            theta=None, nbrs_num=None, time_intv=1, num_epochs=100, num_rand_samples=32,
-            batch_size=1, beta=0, optim_policy="range",
-            mask_size=None):
+            theta=None, nbrs_num=None, time_intv=1, 
+            num_epochs=100, num_rand_samples=32, batch_size=1, beta=0,
+            optim_policy="range"):
         """
         Fit the model using the provided data.
         """
-        # Create a DataLoader once, reuse it each epoch
-        dataloader = self._create_dataloader(X, sample_size, library_size,
-                                            time_intv, num_rand_samples, batch_size,
-                                            optim_policy)
+        dataloader = self._create_dataloader(
+            X, Y,
+            sample_size=sample_size,
+            library_size=library_size,
+            time_intv=time_intv,
+            num_rand_samples=num_rand_samples,
+            optim_policy=optim_policy,
+            batch_size=batch_size
+        )
         
         for epoch in range(num_epochs):
             self.optimizer.zero_grad()
             
-            # Compute CCM loss
-            ccm_loss = self._compute_loss_from_dataloader(dataloader, num_rand_samples, method, theta,
-                                                        nbrs_num, exclusion_rad, mask_size)
-            # Projection norm penalty
-            h_norm = self.__compute_h_norm()
-            total_loss = ccm_loss + beta * h_norm
+            ccm_loss = self._compute_loss_from_dataloader(
+                dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad
+            )
             
+            h_norm_val = self.__compute_h_norm()
+            total_loss = torch.log(ccm_loss) + beta * torch.log(h_norm_val)
+
+            # Backprop and update
             total_loss.backward()
             self.optimizer.step()
-            
+
             print(
                 f"Epoch {epoch + 1}/{num_epochs}, "
-                f"Loss: {total_loss.item():.4f}, "
-                f"ccm_loss: {ccm_loss.item():.4f}, "
-                f"h_norm: {h_norm.item():.4f}"
+                f"CCM Loss: {ccm_loss.item():.4f}, "
+                f"h_norm: {h_norm_val.item():.4f}, "
+                f"Total Loss: {total_loss.item():.4f}"
             )
             self.loss_history.append(total_loss.item())
 
-    def evaluate_loss(self, X_test, 
+    def evaluate_loss(self, X_test, Y_test,
                       sample_size, library_size, exclusion_rad=0, method="knn",
-                      theta=None, nbrs_num=None, time_intv=1,
+                      theta=None, nbrs_num=None, time_intv=1, 
                       num_epochs=None, num_rand_samples=32, batch_size=1, beta=None,
-                      optim_policy="range", mask_size=None):
+                      optim_policy="range"):
         """
-        Evaluate the CCM-based loss on test data, with no parameter updates.
+        Computes only the raw CCM loss on a test set. Importantly, this method does not 
+        calculate predictions based on the training data. Instead, it builds the model using 
+        the test data and calculates the loss as if it were during the training cycle.
+        num_epochs and beta are included for compatibility with the fit method, but are not used.
+
+        Returns:
+            float: The total CCM loss on the test dataset.
         """
         with torch.no_grad():
-            # Build a DataLoader for test data
-            dataloader = self._create_dataloader(X_test,
-                                                sample_size,
-                                                library_size,
-                                                time_intv,
-                                                num_rand_samples,
-                                                batch_size,
-                                                optim_policy)
-            # Accumulate CCM-based loss
-            ccm_loss = self._compute_loss_from_dataloader(dataloader,
-                                                        num_rand_samples,
-                                                        method,
-                                                        theta,
-                                                        nbrs_num,
-                                                        exclusion_rad,
-                                                        mask_size)
-        # Return as a scalar
+            # Create dataloader for test data
+            dataloader = self._create_dataloader(
+                X_test, Y_test,
+                sample_size=sample_size,
+                library_size=library_size,
+                time_intv=time_intv,
+                num_rand_samples=num_rand_samples,
+                optim_policy=optim_policy,
+                batch_size=batch_size
+            )
+
+            ccm_loss = self._compute_loss_from_dataloader(
+                dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad
+            )
         return ccm_loss.item()
 
     def transform(self, X, device="cpu"):
@@ -127,106 +122,95 @@ class FlowDecomposition:
         """
         with torch.no_grad():
             inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
-            outputs = torch.permute(self.model.to(device)(inputs),dims=(0,2,1)) #Easier to interpret
+            outputs = self.model.to(device)(inputs)[:,:,0] 
         return outputs.cpu().numpy()
 
-    def _create_dataloader(self, X, sample_size, library_size, 
-                       time_intv, num_rand_samples, batch_size, 
-                       optim_policy):
+    def _create_dataloader(self, X, Y, sample_size, library_size,
+                           time_intv, num_rand_samples, optim_policy, batch_size):
         """
-        Internal helper to build a DataLoader from the input data and the
-        specified sampling policy.
+        Creates a DataLoader for the given dataset and parameters.
         """
-        # Move numpy or other input into a torch.Tensor
-        X_tensor = torch.tensor(X, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
-        
-        # Decide which range of time lags to use
         if optim_policy == "fixed":
             tp_range = (time_intv, time_intv)
         elif optim_policy == "range":
-            tp_range = (1, time_intv)
+            tp_range = (0, time_intv)
         else:
             raise ValueError(f"Unknown optim_policy: {optim_policy}")
 
+        X_tensor = torch.tensor(X, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
+        Y_tensor = torch.tensor(Y, requires_grad=False, device=self.data_device, dtype=DATA_DTYPE)
+
         dataset = RandomSampleSubsetPairDataset(
-            X = X_tensor,
-            sample_size = sample_size,
-            subset_size = library_size,
-            E = self.num_delays,
-            tau = self.delay_step,
-            num_batches = num_rand_samples,
-            tp_range = tp_range,
-            device = self.data_device,
-            random_state = self.random_state,
+            X=X_tensor,
+            y=Y_tensor,
+            sample_size=sample_size,
+            subset_size=library_size,
+            E=self.num_delays,
+            tau=self.delay_step,
+            num_batches=num_rand_samples,
+            tp_range=tp_range,
+            device=self.data_device,
+            random_state=self.random_state,
         )
-        dataloader = DataLoader(dataset, 
-                                batch_size=batch_size, 
-                                pin_memory=False, 
-                                num_workers=0)
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            pin_memory=False,
+            num_workers=0
+        )
         return dataloader
 
-    def _compute_loss_from_dataloader(self, dataloader, num_rand_samples, method,
-                                    theta, nbrs_num, exclusion_rad, mask_size):
+    def _compute_loss_from_dataloader(self, dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad):
         """
-        Internal helper to accumulate CCM-based loss over all DataLoader batches.
+        Computes only the CCM-based loss over the batches.
         """
-        ccm_loss = 0.0
+        total_loss = 0.0
         for subset_idx, sample_idx, subset_X, subset_y, sample_X, sample_y in dataloader:
-            # Move everything to the right device/dtype
+            # Move tensors to the appropriate device and type.
             subset_idx = subset_idx.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
             sample_idx = sample_idx.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-            subset_X   = subset_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-            subset_y   = subset_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-            sample_X   = sample_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-            sample_y   = sample_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
-
-            # Project data with the trained model
-            # => shape: [batch, subset_size, E, proj_dim, n_components]
+            subset_X = subset_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            subset_y = subset_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            sample_X = sample_X.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            sample_y = sample_y.to(self.device, dtype=MODEL_DTYPE, non_blocking=True)
+            
+            # Compute embeddings for the subset and sample
             subset_X_z = self.model(subset_X)
             sample_X_z = self.model(sample_X)
-            subset_y_z = self.model(subset_y)
-            sample_y_z = self.model(sample_y)
             
-            # Flatten the E,proj_dim => single embedding dimension
-            # => shape: [batch, subset_size, E*proj_dim, n_components]
-            subset_X_z = subset_X_z.reshape(*subset_X_z.shape[:2], -1, subset_X_z.shape[-1])
-            sample_X_z = sample_X_z.reshape(*sample_X_z.shape[:2], -1, sample_X_z.shape[-1])
-            subset_y_z = subset_y_z.reshape(*subset_y_z.shape[:2], -1, subset_y_z.shape[-1])
-            sample_y_z = sample_y_z.reshape(*sample_y_z.shape[:2], -1, sample_y_z.shape[-1])
-
-            # Compute CCM-based loss for this batch
+            # Use the last element of y as in the fit method.
+            subset_y_z = subset_y[:, :, [-1]].unsqueeze(-1)
+            sample_y_z = sample_y[:, :, [-1]].unsqueeze(-1)
+            
+            # Reshape to match expected dimensions:
+            subset_X_z = subset_X_z.reshape(subset_X_z.size(0), subset_X_z.size(1), -1, subset_X_z.size(4))
+            sample_X_z = sample_X_z.reshape(sample_X_z.size(0), sample_X_z.size(1), -1, sample_X_z.size(4))
+            subset_y_z = subset_y_z.reshape(subset_y_z.size(0), subset_y_z.size(1), -1, subset_y_z.size(4))
+            sample_y_z = sample_y_z.reshape(sample_y_z.size(0), sample_y_z.size(1), -1, sample_y_z.size(4))
+            
+            # Compute the CCM-based loss for this batch.
             loss = self.__compute_loss(
                 subset_idx, sample_idx,
                 sample_X_z, sample_y_z,
                 subset_X_z, subset_y_z,
-                method, theta, nbrs_num,
-                exclusion_rad, mask_size
+                method, theta, nbrs_num, exclusion_rad
             )
-            # Average across the random draws
+            # Divide by num_rand_samples to average across random draws
             loss /= num_rand_samples
-            # Accumulate
-            ccm_loss += loss.sum()
-
-        return ccm_loss
-
-    def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y,
-                   method, theta=None, nbrs_num=None, exclusion_rad=0, mask_size=None):
- 
-        dim = self.n_comp
-
-        if mask_size is not None:
-            rand_idx = torch.argsort(torch.rand(dim,device=self.device))[:mask_size]
-            sample_X = sample_X[:,:,:,rand_idx]
-            sample_y = sample_y[:,:,:,rand_idx]
-            subset_X = subset_X[:,:,:,rand_idx]
-            subset_y = subset_y[:,:,:,rand_idx]
-
-            dim = mask_size
+            total_loss += loss.sum()
         
+        return total_loss
+    
+    def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y,
+                       method, theta=None, nbrs_num=None, exclusion_rad=0):
+        """
+        Internal method computing the correlation-based loss for a given batch.
+        """
         if method == "smap":
             if theta is None:
                 raise ValueError("`theta` must be provided when using the 'smap' method.")
-            ccm = self.__get_smap_ccm_matrix_approx(
+            ccm = self._get_smap_ccm_matrix_approx(
                 subset_idx, sample_idx, 
                 sample_X, sample_y, 
                 subset_X, subset_y, 
@@ -234,8 +218,8 @@ class FlowDecomposition:
             )
         elif method == "knn":
             if nbrs_num is None:
-                raise ValueError("`nbrs_num` must be provided when using the 'nrst_nbrs' method.")
-            ccm = self.__get_knn_ccm_matrix_approx(
+                raise ValueError("`nbrs_num` must be provided when using the 'knn' method.")
+            ccm = self._get_knn_ccm_matrix_approx(
                 subset_idx, sample_idx, 
                 sample_X, sample_y, 
                 subset_X, subset_y, 
@@ -244,23 +228,17 @@ class FlowDecomposition:
         else:
             raise ValueError(f"Unknown method: {method}")
         
-        #Shape: (B, E, dim, dim)
-        mask = torch.eye(dim,dtype=bool,device=self.device)
+        # ccm has shape: (B, E, dim, dim)
+        ccm = ccm.squeeze(-2).squeeze(-1)
 
-        ccm = ccm**2
-
+        # Possibly subtract auto-correlation
         if self.subtract_autocorr:
-            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))**2
-            if dim > 1:
-                score = 1 + torch.abs(ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
-            else:
-                score = 1 + (-ccm[:,:,0,0] + corr[:,:,0,0]).mean(axis=1)
+            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X, sample_y))
+            corr = corr.squeeze(-2).squeeze(-1)
+            score = 1 + (-(ccm) + corr).mean(axis=1)
             return score
         else:
-            if dim > 1:
-                score = 1 + torch.abs(ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) 
-            else:
-                score = 1 + (-ccm[:,:,0,0]).mean(axis=1)
+            score = 1 + (-(ccm)).mean(axis=1)
             return score
         
     def __compute_h_norm(self):
@@ -274,7 +252,13 @@ class FlowDecomposition:
 
         return h_norm
 
-    def __get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
+    def _get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
+        A, B = self._get_knn_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad)
+        
+        r_AB = self.__get_batch_corr(A,B)
+        return r_AB
+    
+    def _get_knn_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
         _, _, dim_y, _ = sample_y.shape
@@ -295,17 +279,22 @@ class FlowDecomposition:
         # [batch, sample_size, dim_y, nbrs_num, n_comp, n_comp]
         # Start with weights of shape: [B, n_comp, sample_size, nbrs_num]
         w = weights.permute(0, 2, 3, 1)  # Now shape: [B, sample_size, nbrs_num, n_comp]
-        w = w.unsqueeze(2).unsqueeze(-2) # Final shape: [B, sample_size, 1, nbrs_num, 1, n_comp] #TODO: w.unsqueeze(2).unsqueeze(-1) ?
+        w = w.unsqueeze(2).unsqueeze(-2) # Final shape: [B, sample_size, 1, nbrs_num, 1,  n_comp]
 
         A = (result * w).sum(dim=3) 
         # [batch, num_points, dim, n_comp, n_comp]
 
         B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
+
+        return A, B
+    
+    def _get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
+        A, B = self._get_smap_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad)
         
         r_AB = self.__get_batch_corr(A,B)
         return r_AB
     
-    def __get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
+    def _get_smap_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
         _, _, dim_y, _ = sample_y.shape
@@ -354,8 +343,7 @@ class FlowDecomposition:
 
         B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
         
-        r_AB = self.__get_batch_corr(A,B)
-        return r_AB
+        return A, B
     
     def __get_local_weights(self, lib, sublib, subset_idx, sample_idx, exclusion_rad, theta):
         #[batch, comp, points, proj_dim]
@@ -415,28 +403,27 @@ class FlowDecomposition:
         
         r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
         return r_AB    
-    
+
     def save(self, filepath: str):
         """
         Saves the model, optimizer state, and other attributes to disk.
         """
-        # 1) Collect constructor / hyperparams needed to re-initialize
+        # 1) Gather constructor params
         init_params = {
             "input_dim": self.input_dim,
             "proj_dim": self.proj_dim,
-            "n_components": self.n_comp,
             "num_delays": self.num_delays,
             "delay_step": self.delay_step,
             "model": "linear" if isinstance(self.model, LinearModel) else "nonlinear",
             "subtract_autocorr": self.subtract_autocorr,
-            "device": self.device,       # might be overridden on load
+            "device": self.device,
             "data_device": self.data_device,
             "optimizer": type(self.optimizer).__name__,
             "learning_rate": self.optimizer.param_groups[0]['lr'],
             "random_state": self.random_state
         }
 
-        # 2) Create checkpoint dictionary
+        # 2) Create checkpoint
         checkpoint = {
             "init_params": init_params,
             "model_state": self.model.state_dict(),
@@ -444,38 +431,30 @@ class FlowDecomposition:
             "loss_history": self.loss_history,
         }
 
-        # 3) Save checkpoint
+        # 3) Save to disk
         torch.save(checkpoint, filepath)
-        print(f"Model saved to {filepath}")
+        print(f"FlowRegression model saved to {filepath}")
 
     @classmethod
     def load(cls, filepath: str, map_location: str = "cpu"):
         """
-        Loads a saved model from disk.
-        Args:
-            filepath (str): Path to the saved file.
-            map_location (str): Device mapping for the checkpoint (e.g. "cpu" or "cuda").
-        Returns:
-            FlowDecomposition: A new FlowDecomposition instance with loaded state.
+        Loads a saved FlowRegression model from disk.
         """
         # 1) Load checkpoint
         checkpoint = torch.load(filepath, map_location=map_location)
         init_params = checkpoint["init_params"]
 
-        # 2) Instantiate a new instance with the stored hyperparams
-        #    Note: we override `device` in init_params so that the new instance
-        #    is created on `map_location`, if desired. 
+        # 2) Instantiate new instance
         init_params["device"] = map_location
         init_params["data_device"] = map_location
-
         new_instance = cls(**init_params)
 
         # 3) Load model and optimizer states
         new_instance.model.load_state_dict(checkpoint["model_state"])
         new_instance.optimizer.load_state_dict(checkpoint["optimizer_state"])
 
-        # 4) Restore any extra info such as training history
+        # 4) Restore additional data
         new_instance.loss_history = checkpoint["loss_history"]
 
-        print(f"Model loaded from {filepath}")
+        print(f"FlowRegression model loaded from {filepath}")
         return new_instance
