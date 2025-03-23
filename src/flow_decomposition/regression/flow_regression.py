@@ -12,11 +12,23 @@ class FlowRegression:
 
     def __init__(self, input_dim, proj_dim, 
                  num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
-                 device="cuda",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None, verbose=1):
+                 device="cuda", data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None, verbose=1):
         """
         Initializes the FlowRegression model.
         
         Args:
+            input_dim: Dimensionality of the input data
+            proj_dim: Dimensionality of the projection
+            num_delays: Number of delay embeddings to use
+            delay_step: Step size between delays
+            model: Either "linear", "nonlinear", or a custom torch.nn.Module instance
+            subtract_autocorr: Whether to subtract autocorrelation from the CCM score
+            device: Device to run the model on ("cuda" or "cpu")
+            data_device: Device to store the data on
+            optimizer: Optimizer to use (string name from torch.optim)
+            learning_rate: Learning rate for the optimizer
+            random_state: Random seed for reproducibility
+            verbose: Verbosity level (0 or 1)
         """
         self.device = device
         self.data_device = data_device
@@ -29,10 +41,12 @@ class FlowRegression:
         self.input_dim = input_dim
         self.verbose = verbose
 
-        if model == "linear":
-            self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device,random_state=random_state)
+        if isinstance(model, torch.nn.Module):
+            self.model = model
+        elif model == "linear":
+            self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device, random_state=random_state)
         elif model == "nonlinear":
-            self.model = NonlinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device,random_state=random_state)
+            self.model = NonlinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device, random_state=random_state)
         else:
             raise ValueError(f"Unknown model: {model}")
         
@@ -79,7 +93,7 @@ class FlowRegression:
                     f"h_norm: {h_norm_val.item():.4f}, "
                     f"Total Loss: {total_loss.item():.4f}"
                 )
-                
+
             self.loss_history.append(total_loss.item())
 
     def evaluate_loss(self, X_test, Y_test,

@@ -72,7 +72,7 @@ class ModelCV:
 
         return self.scores
     
-    def cross_validate_ccm(self, X, fit_params: dict, eval_params: dict = None, y=None):
+    def cross_validate_manual(self, X, fit_params: dict, eval_params: dict = None, y=None):
         """
         Performs k-fold cross-validation, using FastCCM to evalute the model.
 
@@ -134,15 +134,16 @@ class ModelCV:
                                                             exclusion_rad=eval_params["exclusion_rad"],tp=tp,
                                                             method="simplex" if eval_params["method"] == "knn" else "smap",
                                                             theta=eval_params["theta"], nrst_num = eval_params["nbrs_num"])[:,:,0,0]
-                            for i in range(1)
+                            for i in range(5)
                         ]).mean(axis=0)
                     
                     corr_values = np.array([pearsonr(Y_val[:, i], Y_pred[:, i])[0] for i in range(Y_val.shape[1])])
                     val_loss += [np.mean(corr_values)]
-                    
+
                 val_loss = np.mean(val_loss)
             else:
-                val_loss = model_clone.evaluate_loss(X_val, **eval_params)
+                #TODO: implement manual evaluation for unsupervised models
+                pass
 
             print(f"Fold {fold} validation loss: {val_loss:.4f}")
             self.fold_models.append(model_clone)
