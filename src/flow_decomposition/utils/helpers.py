@@ -72,7 +72,7 @@ class ModelCV:
 
         return self.scores
     
-    def cross_validate_manual(self, X, fit_params: dict, eval_params: dict = None, y=None):
+    def cross_validate_manual(self, X, fit_params: dict, eval_params: dict = None, y=None, scorer=lambda a,b: np.mean([pearsonr(a,b)[0] for i in range(a.shape[1])])):
         """
         Performs k-fold cross-validation, using FastCCM to evalute the model.
 
@@ -137,8 +137,7 @@ class ModelCV:
                             for i in range(5)
                         ]).mean(axis=0)
                     
-                    corr_values = np.array([pearsonr(Y_val[:, i], Y_pred[:, i])[0] for i in range(Y_val.shape[1])])
-                    val_loss += [np.mean(corr_values)]
+                    val_loss += [scorer(Y_val[-Y_pred.shape[0]:, :], Y_pred[:, :])]
 
                 val_loss = np.mean(val_loss)
             else:

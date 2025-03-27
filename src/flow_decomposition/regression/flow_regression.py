@@ -80,7 +80,7 @@ class FlowRegression:
             )
             
             h_norm_val = self.__compute_h_norm()
-            total_loss = torch.log(ccm_loss) + beta * torch.log(h_norm_val)
+            total_loss = torch.log(ccm_loss + beta * h_norm_val)
 
             # Backprop and update
             total_loss.backward()
