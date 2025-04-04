@@ -64,6 +64,11 @@ class FlowDecomposition:
         Fit the model using the provided data.
         """
         # Create a DataLoader once, reuse it each epoch
+
+        if self.random_state is not None:
+            old_rng_state = torch.get_rng_state()
+            torch.manual_seed(self.random_state) #TODO: Not safe for multiple workers
+
         dataloader = self._create_dataloader(X, sample_size, library_size,
                                             time_intv, num_rand_samples, batch_size,
                                             optim_policy)
@@ -89,6 +94,9 @@ class FlowDecomposition:
                     f"h_norm: {h_norm.item():.4f}"
                 )
             self.loss_history.append(total_loss.item())
+        
+        if self.random_state is not None:
+            torch.set_rng_state(old_rng_state)
 
     def evaluate_loss(self, X_test, 
                       sample_size, library_size, exclusion_rad=0, method="knn",
@@ -98,6 +106,11 @@ class FlowDecomposition:
         """
         Evaluate the CCM-based loss on test data, with no parameter updates.
         """
+        
+        if self.random_state is not None:
+            old_rng_state = torch.get_rng_state()
+            torch.manual_seed(self.random_state) #TODO: Not safe for multiple workers
+
         with torch.no_grad():
             # Build a DataLoader for test data
             dataloader = self._create_dataloader(X_test,
@@ -115,6 +128,9 @@ class FlowDecomposition:
                                                         nbrs_num,
                                                         exclusion_rad,
                                                         mask_size)
+        
+        if self.random_state is not None:
+            torch.set_rng_state(old_rng_state)
         # Return as a scalar
         return ccm_loss.item()
 

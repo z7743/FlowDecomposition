@@ -51,6 +51,11 @@ class DecomposedFlowRegression:
         """
         Fit the model using the provided data.
         """
+
+        if self.random_state is not None:
+            old_rng_state = torch.get_rng_state()
+            torch.manual_seed(self.random_state) #TODO: Not safe for multiple workers
+
         dataloader = self._create_dataloader(
             X, Y,
             sample_size=sample_size,
@@ -84,6 +89,9 @@ class DecomposedFlowRegression:
                 )
             self.loss_history.append(total_loss.item())
 
+        if self.random_state is not None:
+            torch.set_rng_state(old_rng_state)
+
     def evaluate_loss(self, X_test, Y_test,
                       sample_size, library_size, exclusion_rad=0, method="knn",
                       theta=None, nbrs_num=None, time_intv=1, 
@@ -98,6 +106,11 @@ class DecomposedFlowRegression:
         Returns:
             float: The total CCM loss on the test dataset.
         """
+
+        if self.random_state is not None:
+            old_rng_state = torch.get_rng_state()
+            torch.manual_seed(self.random_state) #TODO: Not safe for multiple workers
+
         with torch.no_grad():
             # Create dataloader for test data
             dataloader = self._create_dataloader(
@@ -113,6 +126,10 @@ class DecomposedFlowRegression:
             ccm_loss = self._compute_loss_from_dataloader(
                 dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad
             )
+        
+        if self.random_state is not None:
+            torch.set_rng_state(old_rng_state)
+
         return ccm_loss.item()
 
     def transform(self, X, device="cpu"):

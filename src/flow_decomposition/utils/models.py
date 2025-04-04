@@ -90,9 +90,14 @@ class LinearModel(nn.Module):
         self.proj_dim = proj_dim
         self.n_comp = n_comp
 
-        if random_state != None:
+        if random_state is not None:
+            old_rng_state = torch.get_rng_state()
             torch.manual_seed(random_state)
+
         self.model = nn.Linear(input_dim, n_comp*proj_dim, bias=False,device=device, dtype=dtype)
+
+        if random_state is not None:
+            torch.set_rng_state(old_rng_state)
 
     def forward(self, x):
         x_shape = x.shape
@@ -127,6 +132,7 @@ class NonlinearModel(nn.Module):
         self.n_comp = n_comp
 
         if random_state is not None:
+            old_rng_state = torch.get_rng_state()
             torch.manual_seed(random_state)
 
         self.model = nn.Sequential(
@@ -136,6 +142,9 @@ class NonlinearModel(nn.Module):
             nn.GELU(),
             nn.Linear(proj_dim * n_comp * 2, proj_dim * n_comp, bias=False, device=device, dtype=dtype)
         )
+
+        if random_state is not None:
+            torch.set_rng_state(old_rng_state)
 
     def forward(self, x):
         """

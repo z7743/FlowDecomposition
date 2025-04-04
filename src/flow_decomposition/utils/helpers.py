@@ -72,7 +72,13 @@ class ModelCV:
 
         return self.scores
     
-    def cross_validate_manual(self, X, fit_params: dict, eval_params: dict = None, y=None, scorer=lambda a,b: np.mean([pearsonr(a,b)[0] for i in range(a.shape[1])])):
+    def cross_validate_manual(self, X, 
+                              fit_params: dict, 
+                              eval_params: dict = None, 
+                              y=None, 
+                              scorer=lambda a,b: np.mean([pearsonr(a,b)[0] for i in range(a.shape[1])]), 
+                              device="cpu",
+                              repeat=5):
         """
         Performs k-fold cross-validation, using FastCCM to evalute the model.
 
@@ -82,7 +88,9 @@ class ModelCV:
             fit_params (dict): Keyword arguments to pass to the model's `fit()` method.
             eval_params (dict, optional): Keyword arguments to pass to the model's `evaluate_loss()` method.
                                           If None, `fit_params` will be used.
-        
+            scorer (function): A function that takes two arrays and returns a score.
+            device (str): Device to run the FastCCM model on.
+            repeat (int): Number of times to repeat the FastCCM model and average the results.
         Returns:
             scores (list): A list of CCM rho values for each fold.
         """
@@ -127,17 +135,17 @@ class ModelCV:
                     Y_val = Y_val[rand_i]
 
                     Y_pred = np.array([
-                            PairwiseCCM("cpu").predict(X_train_z[None], 
+                            PairwiseCCM(device).predict(X_train_z[None], 
                                                         Y_train[None],
                                                         X_val_z[None],
-                                                            subset_size=eval_params["library_size"],
-                                                            exclusion_rad=eval_params["exclusion_rad"],tp=tp,
-                                                            method="simplex" if eval_params["method"] == "knn" else "smap",
-                                                            theta=eval_params["theta"], nrst_num = eval_params["nbrs_num"])[:,:,0,0]
-                            for i in range(5)
+                                                        subset_size=eval_params["library_size"],
+                                                        exclusion_rad=eval_params["exclusion_rad"],tp=tp,
+                                                        method="simplex" if eval_params["method"] == "knn" else "smap",
+                                                        theta=eval_params["theta"], nrst_num = eval_params["nbrs_num"])[:,:,0,0]
+                            for _ in range(repeat)
                         ]).mean(axis=0)
                     
-                    val_loss += [scorer(Y_val[-Y_pred.shape[0]:, :], Y_pred[:, :])]
+                    val_loss += [scorer(Y_val[-Y_pred.shape[0]:], Y_pred)]
 
                 val_loss = np.mean(val_loss)
             else:

@@ -209,8 +209,7 @@ class RandomSampleSubsetPairDataset(Dataset):
         tp_range = (1, 2),
         device = "cpu", 
         E = None,
-        tau = None,
-        random_state = None,
+        tau = None
     ):
         """
         Parameters:
@@ -239,7 +238,6 @@ class RandomSampleSubsetPairDataset(Dataset):
         self.subset_size = subset_size
         self.num_batches = num_batches
         self.num_datapoints = self.X.shape[0]
-        self.random_state = random_state
 
         if isinstance(tp_range, (list, tuple)) and len(tp_range) == 2:
             tp_min, tp_max = tp_range
@@ -273,10 +271,10 @@ class RandomSampleSubsetPairDataset(Dataset):
         return self.num_batches
 
     def _get_local_generator(self, idx):
-        if self.random_state is not None:
-            gen = torch.Generator(device=self.device)
-            gen.manual_seed(self.random_state + idx)
-            return gen
+        #if self.random_state is not None:
+        #    gen = torch.Generator(device=self.device)
+        #    gen.manual_seed(self.random_state + idx)
+        #    return gen
         return None
 
     def _sample_candidates(self, num, generator=None):
