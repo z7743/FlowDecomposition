@@ -2,3 +2,4 @@ from .regression.flow_regression import FlowRegression
 from .regression.weighted_flow_regression import WeightedFlowRegression
 from .regression.decomposed_flow_regression import DecomposedFlowRegression
 from .decomposition.flow_decomposition import FlowDecomposition
+from .regression.flow_autoencoder import FlowAutoencoder
