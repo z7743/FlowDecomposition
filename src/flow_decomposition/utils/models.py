@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class BaseDecompositionModel(nn.Module):
     """
@@ -164,6 +165,72 @@ class NonlinearModel(nn.Module):
         """
         Retrieves the weights of the final linear layer.
 
+        Returns:
+            numpy.ndarray: Weights of the final linear layer reshaped and permuted.
+        """
+        final_layer = self.model[-1]
+        # Permute and reshape to mirror the LinearModel's get_weights() method.
+        weights = torch.permute(final_layer.weight.T.reshape(-1, self.proj_dim, self.n_comp), dims=(0, 2, 1))
+        return weights.cpu().detach().numpy()
+
+class AutoencoderModel(nn.Module):
+    def __init__(self, input_dim, proj_dim, n_comp, device="cuda", dtype=torch.float32, random_state=None):
+        """
+        Initializes the nonlinear projection module.
+        Args:
+            input_dim (int): The dimension of the input data.
+            proj_dim (int): The dimension of the output projection.
+            n_comp (int): The number of the output components.
+            device (str, optional): Device to place the model on, default is "cuda".
+            random_state (int): Ignored if None.
+        """
+        super(AutoencoderModel, self).__init__()
+        self.device = device
+        self.proj_dim = proj_dim
+        self.n_comp = n_comp
+
+        if random_state is not None:
+            old_rng_state = torch.get_rng_state()
+            torch.manual_seed(random_state)
+
+        self.fc1 = nn.Linear(input_dim, proj_dim * n_comp * 8,bias=True, device=device, dtype=dtype)
+        self.fc2 = nn.Linear(proj_dim * n_comp * 8, proj_dim * n_comp * 4,bias=True, device=device, dtype=dtype)
+        self.fc3 = nn.Linear(proj_dim * n_comp * 4, proj_dim * n_comp * 2,bias=True, device=device, dtype=dtype)
+        self.fc_mu = nn.Linear(proj_dim * n_comp * 2, proj_dim * n_comp, device=device, dtype=dtype)
+        self.fc_logvar = nn.Linear(proj_dim * n_comp * 2, proj_dim * n_comp, device=device, dtype=dtype)
+        
+        if random_state is not None:
+            torch.set_rng_state(old_rng_state)
+
+    def reparameterize(self, mu, logvar):
+        # Compute standard deviation and sample epsilon from a normal distribution
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def forward(self, x):
+        """
+        Forward pass: Applies the nonlinear transformations and reshapes the output.
+        Args:
+            x (torch.Tensor): Input tensor with shape (..., input_dim).
+        Returns:
+            torch.Tensor: Output tensor reshaped to (..., proj_dim, n_comp).
+        """
+        x_shape = x.shape
+        x = F.tanh(self.fc1(x))
+        x = F.tanh(self.fc2(x))
+        x = F.tanh(self.fc3(x))
+        mu = (self.fc_mu(x))
+        logvar = (self.fc_logvar(x))
+        z = self.reparameterize(mu, logvar)
+        z = z.reshape(*x_shape[:-1], self.proj_dim, self.n_comp)
+        mu = mu.reshape(*x_shape[:-1], self.proj_dim, self.n_comp)
+        logvar = logvar.reshape(*x_shape[:-1], self.proj_dim, self.n_comp)
+        return z, mu, logvar
+    
+    def get_weights(self):
+        """
+        Retrieves the weights of the final linear layer.
         Returns:
             numpy.ndarray: Weights of the final linear layer reshaped and permuted.
         """
