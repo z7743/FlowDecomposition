@@ -202,7 +202,7 @@ class AutoencoderModel(nn.Module):
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, padding=1,device=device, dtype=dtype)
         self.conv2 = nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, padding=1,device=device, dtype=dtype)
         self.fc1 = nn.Linear(in_features=16 * 7 * 7, out_features=64,device=device, dtype=dtype)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2,device=device, dtype=dtype)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
         self.fc_mu = nn.Linear(64, proj_dim * n_comp, device=device, dtype=dtype)
         self.fc_logvar = nn.Linear(64, proj_dim * n_comp, device=device, dtype=dtype)
         
