@@ -176,7 +176,7 @@ class FlowDecomposition:
             num_batches = num_rand_samples,
             tp_range = tp_range,
             device = self.data_device,
-            random_state = self.random_state,
+            #random_state = self.random_state,
         )
         dataloader = DataLoader(dataset, 
                                 batch_size=batch_size, 
