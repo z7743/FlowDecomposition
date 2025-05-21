@@ -8,63 +8,50 @@ from torch.utils.data import DataLoader
 DATA_DTYPE = torch.float32
 MODEL_DTYPE = torch.float32
 
-class FlowRegression:
+class DecomposedFlowRegression:
 
-    def __init__(self, input_dim, proj_dim, 
+    def __init__(self, input_dim, proj_dim, n_components,
                  num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
-                 regularizer="h_norm", tol=None,
-                 device="cuda", data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None, verbose=1):
+                 device="cuda",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None, verbose=1):
         """
         Initializes the FlowRegression model.
         
         Args:
-            input_dim: Dimensionality of the input data
-            proj_dim: Dimensionality of the projection
-            num_delays: Number of delay embeddings to use
-            delay_step: Step size between delays
-            model: Either "linear", "nonlinear", or a custom torch.nn.Module instance
-            subtract_autocorr: Whether to subtract autocorrelation from the CCM score
-            device: Device to run the model on ("cuda" or "cpu")
-            data_device: Device to store the data on
-            optimizer: Optimizer to use (string name from torch.optim)
-            learning_rate: Learning rate for the optimizer
-            random_state: Random seed for reproducibility
-            verbose: Verbosity level (0 or 1)
         """
         self.device = device
         self.data_device = data_device
         self.random_state = random_state
         self.proj_dim = proj_dim
+        self.n_comp = n_components
         self.num_delays = num_delays
         self.delay_step = delay_step
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
-        self.input_dim = input_dim
         self.verbose = verbose
-        self.regularizer = regularizer
-        self.tol = tol
 
-        if isinstance(model, torch.nn.Module):
-            self.model = model
-        elif model == "linear":
-            self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device, random_state=random_state)
+        if model == "linear":
+            self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=n_components, device=device,random_state=random_state)
         elif model == "nonlinear":
-            self.model = NonlinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=1, device=device, random_state=random_state)
+            self.model = NonlinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=n_components, device=device,random_state=random_state)
         else:
             raise ValueError(f"Unknown model: {model}")
         
-        self.optimizer = getattr(optim, optimizer)(self.model.parameters(), lr=learning_rate)
         self.use_delay = bool(num_delays) and bool(delay_step)
+
+
+        self.component_mixing = torch.nn.Sequential(torch.nn.Linear(n_components, 1, bias=False)).to(device)
+        self.optimizer = getattr(optim, optimizer)(list(self.model.parameters()) + list(self.component_mixing.parameters()), lr=learning_rate)
 
 
     def fit(self, X, Y,
             sample_size, library_size, exclusion_rad=0, method="knn",
-            theta=None, nbrs_num=None, time_intv=1, beta=0,
-            num_epochs=100, num_rand_samples=32, batch_size=1,
+            theta=None, nbrs_num=None, time_intv=1, 
+            num_epochs=100, num_rand_samples=32, batch_size=1, beta=0,
             optim_policy="range"):
         """
         Fit the model using the provided data.
         """
+
         if self.random_state is not None:
             old_rng_state = torch.get_rng_state()
             torch.manual_seed(self.random_state) #TODO: Not safe for multiple workers
@@ -79,16 +66,15 @@ class FlowRegression:
             batch_size=batch_size
         )
         
-        ema_loss = None
         for epoch in range(num_epochs):
             self.optimizer.zero_grad()
             
-            ccm_loss = self._compute_prediction_loss(
+            ccm_loss = self._compute_loss_from_dataloader(
                 dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad
             )
             
-            h_norm_val = self.__regularization_loss()
-            total_loss = (ccm_loss) + beta * (h_norm_val)
+            h_norm_val = self.__compute_h_norm()
+            total_loss = torch.log(ccm_loss + beta * h_norm_val)
 
             # Backprop and update
             total_loss.backward()
@@ -101,29 +87,12 @@ class FlowRegression:
                     f"h_norm: {h_norm_val.item():.4f}, "
                     f"Total Loss: {total_loss.item():.4f}"
                 )
-
             self.loss_history.append(total_loss.item())
 
-            loss_val = total_loss.item()                    
-            if self.tol is not None:
-                if ema_loss is None:                  
-                    ema_loss = loss_val
-                else:                                     
-                    delta = abs(loss_val - ema_loss)
-
-                    if delta < self.tol * max(1.0, abs(ema_loss)):
-                        if self.verbose:
-                            print(f"Early-stopped at epoch {epoch + 1} "
-                                f"(Δloss={delta:.3g} < tol={self.tol})")
-                        break
-
-                    ema_loss = 0.1 * loss_val + 0.9 * ema_loss
-            
-                    
         if self.random_state is not None:
             torch.set_rng_state(old_rng_state)
 
-    def evaluate_loss(self, X, Y,
+    def evaluate_loss(self, X_test, Y_test,
                       sample_size, library_size, exclusion_rad=0, method="knn",
                       theta=None, nbrs_num=None, time_intv=1, 
                       num_epochs=None, num_rand_samples=32, batch_size=1, beta=None,
@@ -140,12 +109,12 @@ class FlowRegression:
 
         if self.random_state is not None:
             old_rng_state = torch.get_rng_state()
-            torch.manual_seed(self.random_state)
+            torch.manual_seed(self.random_state) #TODO: Not safe for multiple workers
 
         with torch.no_grad():
             # Create dataloader for test data
             dataloader = self._create_dataloader(
-                X, Y,
+                X_test, Y_test,
                 sample_size=sample_size,
                 library_size=library_size,
                 time_intv=time_intv,
@@ -154,7 +123,7 @@ class FlowRegression:
                 batch_size=batch_size
             )
 
-            ccm_loss = self._compute_prediction_loss(
+            ccm_loss = self._compute_loss_from_dataloader(
                 dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad
             )
         
@@ -175,7 +144,7 @@ class FlowRegression:
         """
         with torch.no_grad():
             inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
-            outputs = self.model.to(device)(inputs)[:,:,0] 
+            outputs = torch.permute(self.model.to(device)(inputs),dims=(0,2,1))
         return outputs.cpu().numpy()
 
     def _create_dataloader(self, X, Y, sample_size, library_size,
@@ -202,7 +171,7 @@ class FlowRegression:
             tau=self.delay_step,
             num_batches=num_rand_samples,
             tp_range=tp_range,
-            device=self.data_device
+            device=self.data_device,
         )
 
         dataloader = DataLoader(
@@ -213,7 +182,7 @@ class FlowRegression:
         )
         return dataloader
 
-    def _compute_prediction_loss(self, dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad):
+    def _compute_loss_from_dataloader(self, dataloader, num_rand_samples, method, theta, nbrs_num, exclusion_rad):
         """
         Computes only the CCM-based loss over the batches.
         """
@@ -242,7 +211,7 @@ class FlowRegression:
             sample_y_z = sample_y_z.reshape(sample_y_z.size(0), sample_y_z.size(1), -1, sample_y_z.size(4))
             
             # Compute the CCM-based loss for this batch.
-            loss = self.__crossmapping_loss(
+            loss = self.__compute_loss(
                 subset_idx, sample_idx,
                 sample_X_z, sample_y_z,
                 subset_X_z, subset_y_z,
@@ -254,7 +223,7 @@ class FlowRegression:
         
         return total_loss
     
-    def __crossmapping_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y,
+    def __compute_loss(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y,
                        method, theta=None, nbrs_num=None, exclusion_rad=0):
         """
         Internal method computing the correlation-based loss for a given batch.
@@ -280,65 +249,41 @@ class FlowRegression:
         else:
             raise ValueError(f"Unknown method: {method}")
         
-        # ccm has shape: (B, E, dim, dim)
-        ccm = ccm.squeeze(-2).squeeze(-1)
+        # ccm has shape: (batch, E_y, n_comp_y, n_comp_x)
+        mask = torch.eye(self.n_comp,dtype=bool,device=self.device)
+        #ccm = torch.abs(ccm)
+        #ccm_r = ccm[:,:,mask]
+        #ccm_R = ccm.clone()
+        #ccm_R[:,:,mask] = 1
 
-        # Possibly subtract auto-correlation
+        #score = ccm_r.unsqueeze(-2) @ torch.inverse(ccm_R) @ ccm_r.unsqueeze(-1)
+        #return 1 - score.mean(axis=(1,2,3))
         if self.subtract_autocorr:
-            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X, sample_y))
-            corr = corr.squeeze(-2).squeeze(-1)
-            score = 1 + (-(ccm) + corr).mean(axis=1)
+            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))
+            if self.n_comp > 1:
+                score = 1 + (ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
+                #score = 1 - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
+            else:
+                score = 1 + (-ccm[:,:,0,0] + corr[:,:,0,0]).mean(axis=1)
             return score
         else:
-            score = 1 + (-(ccm)).mean(axis=1)
+            if self.n_comp > 1:
+                score = 1 + (ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2))
+                #score = 1 - (ccm[:,:,mask]).mean(axis=(1,2))
+            else:
+                score = 1 + (-ccm[:,:,0,0]).mean(axis=1)
             return score
         
-    def __regularization_loss(self):
+    def __compute_h_norm(self):
+        l1 = sum(p.abs().sum() 
+                for p in self.model.parameters() if p.requires_grad)
+        l2 = sum(p.norm(2)
+                for p in self.model.parameters() if p.requires_grad)
+        num_w = torch.tensor(sum(p.numel()
+                for p in self.model.parameters() if p.requires_grad),dtype=MODEL_DTYPE)
+        h_norm = 1-(torch.sqrt(num_w) - (l1 / (l2 + 1e-6))) / (torch.sqrt(num_w) - 1)
 
-        if self.regularizer == "h_norm":
-            l1 = sum(p.abs().sum() 
-                    for p in self.model.parameters() if p.requires_grad)
-            l2 = sum(p.norm(2)
-                    for p in self.model.parameters() if p.requires_grad)
-            num_w = torch.tensor(sum(p.numel()
-                    for p in self.model.parameters() if p.requires_grad),dtype=MODEL_DTYPE)
-            h_norm = 1-(torch.sqrt(num_w) - (l1 / (l2 + 1e-12))) / (torch.sqrt(num_w) - 1)
-
-            return h_norm
-        
-        elif self.regularizer == "gini":
-            w = torch.cat([p.view(-1).abs()                      
-                        for p in self.model.parameters()
-                        if p.requires_grad])
-
-            if w.numel() == 0:             
-                return torch.tensor(0., dtype=MODEL_DTYPE,
-                                    device=next(self.model.parameters()).device)
-
-            w_sorted, _ = torch.sort(w)    
-            n = w_sorted.numel()
-
-            index = torch.arange(1, n + 1, device=w_sorted.device, dtype=MODEL_DTYPE)
-            gini = (2.0 * (index * w_sorted).sum()) / (n * w_sorted.sum() + 1e-12) - (n + 1) / n
-
-            g_norm = 1.0 - gini
-
-            return g_norm
-        
-        elif self.regularizer == "l1_l2":
-            
-            l1 = sum(p.abs().sum() 
-                    for p in self.model.parameters() if p.requires_grad)
-            l2 = sum(p.norm(2)
-                    for p in self.model.parameters() if p.requires_grad)
-            
-            reg = (l1 / (l2 + 1e-12))
-            #reg = torch.log1p(l1 / (l2 + 1e-12))
-
-            return reg
-        
-        else:
-            raise ValueError(f"Unknown regularizer: {self.regularizer}")
+        return h_norm
 
     def _get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
         A, B = self._get_knn_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad)
@@ -347,32 +292,36 @@ class FlowRegression:
         return r_AB
     
     def _get_knn_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
-        batch_size, sample_size, dim_x, n_comp = sample_X.shape
+        batch_size, sample_size, dim_x, n_comp_x = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
-        _, _, dim_y, _ = sample_y.shape
+        _, _, dim_y, n_comp_y = sample_y.shape
 
         sample_X_t = sample_X.permute(0, 3, 1, 2)
         subset_X_t = subset_X.permute(0, 3, 1, 2)
         
         weights, indices = self.__get_nbrs_indices(subset_X_t,sample_X_t, nbrs_num, subset_idx, sample_idx, exclusion_rad)
-        # Shape: [batch, n_comp, sample_size, nbrs_num]
+        # Shape: [batch, n_comp_x, sample_size, nbrs_num]
 
         batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1, 1, 1)
         # Shape: [batch, 1, 1, 1]
 
         selected = subset_y[batch_idx, indices, :, :]
-        # [batch, n_comp, sample_size, nbrs_num, dim_y, n_comp]
+        # [batch, n_comp_x, sample_size, nbrs_num, dim_y, n_comp_y]
 
         result = selected.permute(0, 2, 4, 3, 5, 1)
-        # [batch, sample_size, dim_y, nbrs_num, n_comp, n_comp]
-        # Start with weights of shape: [B, n_comp, sample_size, nbrs_num]
-        w = weights.permute(0, 2, 3, 1)  # Now shape: [B, sample_size, nbrs_num, n_comp]
-        w = w.unsqueeze(2).unsqueeze(-2) # Final shape: [B, sample_size, 1, nbrs_num, 1,  n_comp]
+        # [batch, sample_size, dim_y, nbrs_num, n_comp_y, n_comp_x]
+        # Start with weights of shape: [batch, n_comp_x, sample_size, nbrs_num]
+        w = weights.permute(0, 2, 3, 1)  # Now shape: [batch, sample_size, nbrs_num, n_comp_x]
+        w = w.unsqueeze(2).unsqueeze(-2) # Final shape: [batch, sample_size, 1, nbrs_num, 1, n_comp_x]
 
         A = (result * w).sum(dim=3) 
-        # [batch, num_points, dim, n_comp, n_comp]
-
-        B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
+        # [batch, num_points, dim_y, n_comp_y, n_comp_x]
+        #A = A.mean(axis=-1).unsqueeze(-1)
+        #A = self.component_mixing(A)
+        A = A.expand(batch_size,sample_size,dim_y, n_comp_x, n_comp_x)
+        B = A.clone().permute(0,1,2,4,3)
+        B[:,:,:,torch.eye(n_comp_x,dtype=bool,device=self.device)] = sample_y
+        #B = sample_y.unsqueeze(-1)#.expand(batch_size, sample_size, dim_y, n_comp_y, n_comp_x)
 
         return A, B
     
@@ -381,11 +330,11 @@ class FlowRegression:
         
         r_AB = self.__get_batch_corr(A,B)
         return r_AB
-    
+
     def _get_smap_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
-        batch_size, sample_size, dim_x, n_comp = sample_X.shape
+        batch_size, sample_size, dim_x, n_comp_x = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
-        _, _, dim_y, _ = sample_y.shape
+        _, _, dim_y, n_comp_y = sample_y.shape
 
         sample_X_t = sample_X.permute(0, 3, 1, 2)
         subset_X_t = subset_X.permute(0, 3, 1, 2)
@@ -393,23 +342,23 @@ class FlowRegression:
         #Shape: [batch, comp, points, proj_dim]
         
         weights = self.__get_local_weights(subset_X_t,sample_X_t,subset_idx, sample_idx, exclusion_rad, theta)
-        #Shape: [batch, comp, sample_size, subset_size]
+        #Shape: [batch, n_comp_x, sample_size, subset_size]
         W = (weights.unsqueeze(1)
-             .expand(batch_size, n_comp, n_comp, sample_size, subset_size)
-             .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, 1))
+             .expand(batch_size, n_comp_y, n_comp_x, sample_size, subset_size)
+             .reshape(batch_size * n_comp_y * n_comp_x * sample_size, subset_size, 1))
         #Shape: [batch * {comp} * comp * sample_size, subset_size, 1]
 
         X = (subset_X_t.unsqueeze(2).unsqueeze(1)
-             .expand(batch_size, n_comp, n_comp, sample_size, subset_size, dim_x)
-             .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, dim_x))
+             .expand(batch_size, n_comp_y, n_comp_x, sample_size, subset_size, dim_x)
+             .reshape(batch_size * n_comp_y * n_comp_x * sample_size, subset_size, dim_x))
         #Shape: [batch * {comp} * comp * {sample_size}, subset_size, dim_x]
 
         Y = (subset_y_t.unsqueeze(2).unsqueeze(2)
-             .expand(batch_size, n_comp, n_comp, sample_size, subset_size, dim_y)
-             .reshape(batch_size * n_comp * n_comp * sample_size, subset_size, dim_y))
+             .expand(batch_size, n_comp_y, n_comp_x, sample_size, subset_size, dim_y)
+             .reshape(batch_size * n_comp_y * n_comp_x * sample_size, subset_size, dim_y))
         #Shape: [batch * comp * {comp} * {sample_size}, subset_size, dim_y]
 
-        X_intercept = torch.cat([torch.ones((batch_size * n_comp * n_comp * sample_size, subset_size, 1),device=self.device), X], dim=2)
+        X_intercept = torch.cat([torch.ones((batch_size * n_comp_y * n_comp_x * sample_size, subset_size, 1),device=self.device), X], dim=2)
         #Shape: [batch * comp * comp * sample_size, subset_size, dim_x + 1]
 
         X_intercept_weighted = X_intercept * W
@@ -421,15 +370,19 @@ class FlowRegression:
         #Shape: [batch * comp{y} * comp{x} * sample_size, dim_x + 1, dim_y]
 
         X_ = (sample_X_t.unsqueeze(1)
-              .expand(batch_size, n_comp, n_comp, sample_size, dim_x)
-              .reshape(batch_size * n_comp * n_comp * sample_size, dim_x))
-        X_ = torch.cat([torch.ones((batch_size * n_comp * n_comp * sample_size, 1),device=self.device), X_], dim=1)
-        X_ = X_.reshape(batch_size * n_comp * n_comp * sample_size, 1, dim_x+1)
+              .expand(batch_size, n_comp_y, n_comp_x, sample_size, dim_x)
+              .reshape(batch_size * n_comp_y * n_comp_x * sample_size, dim_x))
+        X_ = torch.cat([torch.ones((batch_size * n_comp_y * n_comp_x * sample_size, 1),device=self.device), X_], dim=1)
+        X_ = X_.reshape(batch_size * n_comp_y * n_comp_x * sample_size, 1, dim_x+1)
         
-        A = torch.bmm(X_, beta).reshape(batch_size, n_comp, n_comp, sample_size, dim_y)
+        A = torch.bmm(X_, beta).reshape(batch_size, n_comp_y, n_comp_x, sample_size, dim_y)
         A = torch.permute(A,(0,3,4,1,2))
 
-        B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
+        A = A.expand(batch_size,sample_size,dim_y, n_comp_x, n_comp_x)
+        B = A.clone().permute(0,1,2,4,3)
+        B[:,:,:,torch.eye(n_comp_x,dtype=bool,device=self.device)] = sample_y
+
+        #B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp_y, n_comp_x)
         
         return A, B
     
@@ -492,59 +445,3 @@ class FlowRegression:
         r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
         return r_AB    
 
-    def save(self, filepath: str):
-        """
-        Saves the model, optimizer state, and other attributes to disk.
-        """
-        # 1) Gather constructor params
-        init_params = {
-            "input_dim": self.input_dim,
-            "proj_dim": self.proj_dim,
-            "num_delays": self.num_delays,
-            "delay_step": self.delay_step,
-            "model": "linear" if isinstance(self.model, LinearModel) else "nonlinear",
-            "subtract_autocorr": self.subtract_autocorr,
-            "regularizer": self.regularizer,
-            "tol": self.tol,
-            "device": self.device,
-            "data_device": self.data_device,
-            "optimizer": type(self.optimizer).__name__,
-            "learning_rate": self.optimizer.param_groups[0]['lr'],
-            "random_state": self.random_state
-        }
-
-        # 2) Create checkpoint
-        checkpoint = {
-            "init_params": init_params,
-            "model_state": self.model.state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
-            "loss_history": self.loss_history,
-        }
-
-        # 3) Save to disk
-        torch.save(checkpoint, filepath)
-        print(f"FlowRegression model saved to {filepath}")
-
-    @classmethod
-    def load(cls, filepath: str, map_location: str = "cpu"):
-        """
-        Loads a saved FlowRegression model from disk.
-        """
-        # 1) Load checkpoint
-        checkpoint = torch.load(filepath, map_location=map_location)
-        init_params = checkpoint["init_params"]
-
-        # 2) Instantiate new instance
-        init_params["device"] = map_location
-        init_params["data_device"] = map_location
-        new_instance = cls(**init_params)
-
-        # 3) Load model and optimizer states
-        new_instance.model.load_state_dict(checkpoint["model_state"])
-        new_instance.optimizer.load_state_dict(checkpoint["optimizer_state"])
-
-        # 4) Restore additional data
-        new_instance.loss_history = checkpoint["loss_history"]
-
-        print(f"FlowRegression model loaded from {filepath}")
-        return new_instance

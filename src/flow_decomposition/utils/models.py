@@ -193,18 +193,18 @@ class AutoencoderModel(nn.Module):
             old_rng_state = torch.get_rng_state()
             torch.manual_seed(random_state)
 
-        #self.fc1 = nn.Linear(input_dim, proj_dim * n_comp * 8,bias=True, device=device, dtype=dtype)
-        #self.fc2 = nn.Linear(proj_dim * n_comp * 8, proj_dim * n_comp * 4,bias=True, device=device, dtype=dtype)
-        #self.fc3 = nn.Linear(proj_dim * n_comp * 4, proj_dim * n_comp * 2,bias=True, device=device, dtype=dtype)
-        #self.fc_mu = nn.Linear(proj_dim * n_comp * 2, proj_dim * n_comp, device=device, dtype=dtype)
-        #self.fc_logvar = nn.Linear(proj_dim * n_comp * 2, proj_dim * n_comp, device=device, dtype=dtype)
+        self.fc1 = nn.Linear(input_dim, proj_dim * n_comp * 8,bias=True, device=device, dtype=dtype)
+        self.fc2 = nn.Linear(proj_dim * n_comp * 8, proj_dim * n_comp * 4,bias=True, device=device, dtype=dtype)
+        self.fc3 = nn.Linear(proj_dim * n_comp * 4, proj_dim * n_comp * 2,bias=True, device=device, dtype=dtype)
+        self.fc_mu = nn.Linear(proj_dim * n_comp * 2, proj_dim * n_comp, device=device, dtype=dtype)
+        self.fc_logvar = nn.Linear(proj_dim * n_comp * 2, proj_dim * n_comp, device=device, dtype=dtype)
 
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, padding=1,device=device, dtype=dtype)
-        self.conv2 = nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, padding=1,device=device, dtype=dtype)
-        self.fc1 = nn.Linear(in_features=16 * 7 * 7, out_features=64,device=device, dtype=dtype)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.fc_mu = nn.Linear(64, proj_dim * n_comp, device=device, dtype=dtype)
-        self.fc_logvar = nn.Linear(64, proj_dim * n_comp, device=device, dtype=dtype)
+        #self.conv1 = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, padding=1,device=device, dtype=dtype)
+        #self.conv2 = nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, padding=1,device=device, dtype=dtype)
+        #self.fc1 = nn.Linear(in_features=16 * 7 * 7, out_features=64,device=device, dtype=dtype)
+        #self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        #self.fc_mu = nn.Linear(64, proj_dim * n_comp, device=device, dtype=dtype)
+        #self.fc_logvar = nn.Linear(64, proj_dim * n_comp, device=device, dtype=dtype)
         
         if random_state is not None:
             torch.set_rng_state(old_rng_state)
@@ -215,7 +215,7 @@ class AutoencoderModel(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
     
-    def forward(self, x):
+    def forward1(self, x):
 
         x_shape = x.shape
         x = x.reshape(-1, 1, 28, 28)
@@ -233,7 +233,7 @@ class AutoencoderModel(nn.Module):
         logvar = logvar.reshape(*x_shape[:-1], self.proj_dim, self.n_comp)
         return z, mu, logvar
     
-    def forward1(self, x):
+    def forward(self, x):
         """
         Forward pass: Applies the nonlinear transformations and reshapes the output.
         Args:

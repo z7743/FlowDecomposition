@@ -76,7 +76,7 @@ class ModelCV:
                               fit_params: dict, 
                               eval_params: dict = None, 
                               y=None, 
-                              scorer=lambda a,b: np.mean([pearsonr(a,b)[0] for i in range(a.shape[1])]), 
+                              scorer=lambda a,b: np.mean([pearsonr(a[:,i],b[:,i])[0] for i in range(a.shape[1])]), 
                               device="cpu",
                               repeat=5):
         """
@@ -144,6 +144,14 @@ class ModelCV:
                                                         theta=eval_params["theta"], nrst_num = eval_params["nbrs_num"])[:,:,0,0]
                             for _ in range(repeat)
                         ]).mean(axis=0)
+                    #Y_pred = np.array([
+                    #        (PairwiseCCM("cpu").predict(X_train_z.transpose(1,0,2), 
+                    #                Y_train[None],
+                    #                X_val_z.transpose(1,0,2),10000,exclusion_rad=fit_params["exclusion_rad"],tp=0,
+                    #                method="simplex" if fit_params["method"] == "knn" else "smap",
+                    #                theta=fit_params["theta"], nrst_num = fit_params["nbrs_num"]).squeeze()) 
+                    #        for _ in range(repeat)
+                    #    ]).mean(axis=0)
                     
                     val_loss += [scorer(Y_val[-Y_pred.shape[0]:], Y_pred)]
 

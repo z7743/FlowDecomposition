@@ -1,6 +1,6 @@
 from flow_decomposition.utils.models import LinearModel, NonlinearModel
 from flow_decomposition.utils.data_samplers import RandomSampleSubsetPairDataset
-
+import torch.nn.functional as F
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 DATA_DTYPE = torch.float32
 MODEL_DTYPE = torch.float32
 
-class DecomposedFlowRegression:
+class MultiFlowRegression:
 
     def __init__(self, input_dim, proj_dim, n_components,
                  num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
@@ -172,7 +172,6 @@ class DecomposedFlowRegression:
             num_batches=num_rand_samples,
             tp_range=tp_range,
             device=self.data_device,
-            random_state=self.random_state,
         )
 
         dataloader = DataLoader(
@@ -251,26 +250,25 @@ class DecomposedFlowRegression:
             raise ValueError(f"Unknown method: {method}")
         
         # ccm has shape: (batch, E_y, n_comp_y, n_comp_x)
-        mask = torch.eye(self.n_comp,dtype=bool,device=self.device)
         #ccm = torch.abs(ccm)
         #ccm_r = ccm[:,:,mask]
         #ccm_R = ccm.clone()
         #ccm_R[:,:,mask] = 1
-
+        ccm = ccm[:,:,0]
         #score = ccm_r.unsqueeze(-2) @ torch.inverse(ccm_R) @ ccm_r.unsqueeze(-1)
         #return 1 - score.mean(axis=(1,2,3))
-
         if self.subtract_autocorr:
             corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))
             if self.n_comp > 1:
-                score = 1 + (ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
+                score = 1  - ccm.mean(axis=1) + corr.mean(axis=1)
+                #score = 1 - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
             else:
                 score = 1 + (-ccm[:,:,0,0] + corr[:,:,0,0]).mean(axis=1)
             return score
         else:
             if self.n_comp > 1:
-                #score = 1 + (ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) 
-                score = 1 + (ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).max(dim=2)[0].mean(axis=1)
+                score = 1 - ccm.mean(axis=1)#.mean(axis=(1,2))#.max(axis=2)[0].mean(axis=1)
+                #score = 1 - (ccm[:,:,mask]).mean(axis=(1,2))
             else:
                 score = 1 + (-ccm[:,:,0,0]).mean(axis=1)
             return score
@@ -289,7 +287,7 @@ class DecomposedFlowRegression:
     def _get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
         A, B = self._get_knn_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad)
         
-        r_AB = self.__get_batch_corr(A,B)
+        r_AB = self.neg_cross_entropy_per_dim(A,B)
         return r_AB
     
     def _get_knn_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
@@ -305,23 +303,35 @@ class DecomposedFlowRegression:
 
         batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1, 1, 1)
         # Shape: [batch, 1, 1, 1]
+        comp_idx = torch.arange(n_comp_x, device=self.device).view(1, n_comp_x, 1, 1)
+        # Shape: [1, n_comp_x, 1, 1]
+       
 
-        selected = subset_y[batch_idx, indices, :, :]
+        #selected = subset_y[batch_idx, indices, :, :]
         # [batch, n_comp_x, sample_size, nbrs_num, dim_y, n_comp_y]
+        selected = subset_y.permute(0,2,1,3)[batch_idx, comp_idx,indices]
+        # [batch, n_comp_x, sample_size, nbrs_num, n_comp_y]
 
-        result = selected.permute(0, 2, 4, 3, 5, 1)
+        #result = selected.permute(0, 2, 4, 3, 5, 1)
         # [batch, sample_size, dim_y, nbrs_num, n_comp_y, n_comp_x]
+        result = selected.permute(0, 2, 1, 3, 4)
+        # [batch, sample_size, n_comp_x, nbrs_num, n_comp_y]
+
         # Start with weights of shape: [batch, n_comp_x, sample_size, nbrs_num]
-        w = weights.permute(0, 2, 3, 1)  # Now shape: [batch, sample_size, nbrs_num, n_comp_x]
-        w = w.unsqueeze(2).unsqueeze(-2) # Final shape: [batch, sample_size, 1, nbrs_num, 1, n_comp_x]
+        #w = weights.permute(0, 2, 3, 1)  # Now shape: [batch, sample_size, nbrs_num, n_comp_x]
+        #w = w.unsqueeze(2).unsqueeze(-2) # Final shape: [batch, sample_size, 1, nbrs_num, 1, n_comp_x]
+
+        w = weights.permute(0, 2, 1, 3).unsqueeze(-1)
+        # [batch, sample_size, n_comp_x, nbrs_num, n_comp_y]
 
         A = (result * w).sum(dim=3) 
         # [batch, num_points, dim_y, n_comp_y, n_comp_x]
         #A = A.mean(axis=-1).unsqueeze(-1)
         #A = self.component_mixing(A)
-        A = A.expand(batch_size,sample_size,dim_y, n_comp_x, n_comp_x)
-        B = A.clone().permute(0,1,2,4,3)
-        B[:,:,:,torch.eye(n_comp_x,dtype=bool,device=self.device)] = sample_y
+        #A = A.expand(batch_size,sample_size,dim_y, n_comp_x, n_comp_x)
+        B = sample_y#.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp_y)
+
+        #B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp_y, n_comp_x)
         #B = sample_y.unsqueeze(-1)#.expand(batch_size, sample_size, dim_y, n_comp_y, n_comp_x)
 
         return A, B
@@ -329,7 +339,7 @@ class DecomposedFlowRegression:
     def _get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         A, B = self._get_smap_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad)
         
-        r_AB = self.__get_batch_corr(A,B)
+        r_AB = self.neg_cross_entropy_per_dim(A,B)
         return r_AB
 
     def _get_smap_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
@@ -354,10 +364,11 @@ class DecomposedFlowRegression:
              .reshape(batch_size * n_comp_y * n_comp_x * sample_size, subset_size, dim_x))
         #Shape: [batch * {comp} * comp * {sample_size}, subset_size, dim_x]
 
-        Y = (subset_y_t.unsqueeze(2).unsqueeze(2)
-             .expand(batch_size, n_comp_y, n_comp_x, sample_size, subset_size, dim_y)
-             .reshape(batch_size * n_comp_y * n_comp_x * sample_size, subset_size, dim_y))
-        #Shape: [batch * comp * {comp} * {sample_size}, subset_size, dim_y]
+        Y = (subset_y_t.unsqueeze(2)
+             .expand(batch_size, n_comp_y, sample_size, subset_size, dim_y)
+             .permute(0, 1, 4, 2, 3)
+             .reshape(batch_size * n_comp_y * dim_y * sample_size, subset_size, 1))
+        #Shape: [batch * comp * {dim_y} * {sample_size}, subset_size, 1]
 
         X_intercept = torch.cat([torch.ones((batch_size * n_comp_y * n_comp_x * sample_size, subset_size, 1),device=self.device), X], dim=2)
         #Shape: [batch * comp * comp * sample_size, subset_size, dim_x + 1]
@@ -368,7 +379,7 @@ class DecomposedFlowRegression:
         XTWX = torch.bmm(X_intercept_weighted.transpose(1, 2), X_intercept_weighted)
         XTWy = torch.bmm(X_intercept_weighted.transpose(1, 2), Y_weighted)
         beta = torch.bmm(torch.inverse(XTWX), XTWy)
-        #Shape: [batch * comp{y} * comp{x} * sample_size, dim_x + 1, dim_y]
+        #Shape: [batch * comp{y} * comp{x} * sample_size, dim_x + 1, 1]
 
         X_ = (sample_X_t.unsqueeze(1)
               .expand(batch_size, n_comp_y, n_comp_x, sample_size, dim_x)
@@ -376,14 +387,14 @@ class DecomposedFlowRegression:
         X_ = torch.cat([torch.ones((batch_size * n_comp_y * n_comp_x * sample_size, 1),device=self.device), X_], dim=1)
         X_ = X_.reshape(batch_size * n_comp_y * n_comp_x * sample_size, 1, dim_x+1)
         
-        A = torch.bmm(X_, beta).reshape(batch_size, n_comp_y, n_comp_x, sample_size, dim_y)
-        A = torch.permute(A,(0,3,4,1,2))
+        A = torch.bmm(X_, beta).reshape(batch_size, n_comp_y, dim_y, sample_size)
+        A = A.permute(0, 3, 2, 1)
+        # [batch, sample_size, dim_y, n_comp_y]
 
-        A = A.expand(batch_size,sample_size,dim_y, n_comp_x, n_comp_x)
-        B = A.clone().permute(0,1,2,4,3)
-        B[:,:,:,torch.eye(n_comp_x,dtype=bool,device=self.device)] = sample_y
+        #A = torch.permute(A,(0,3,4,1,2))
 
-        #B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp_y, n_comp_x)
+        B = sample_y
+
         
         return A, B
     
@@ -446,3 +457,12 @@ class DecomposedFlowRegression:
         r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
         return r_AB    
 
+    def neg_cross_entropy_per_dim(self, A, B):
+        A_clamped = A.clamp(min=1e-7, max=1. - 1e-7)
+        elementwise_loss = F.binary_cross_entropy(
+            A_clamped, B.float(), reduction="none"
+        )
+        # Now average over the 'num_points' dimension => shape (batch, num_dimensions)
+        loss_per_dim = elementwise_loss.mean(dim=1)
+        
+        return -loss_per_dim
