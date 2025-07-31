@@ -94,6 +94,8 @@ class FlowDecomposition:
                     f"h_norm: {h_norm.item():.4f}"
                 )
             self.loss_history.append(total_loss.item())
+
+            #self.model.model.orthonormalise()
         
         if self.random_state is not None:
             torch.set_rng_state(old_rng_state)
@@ -266,10 +268,8 @@ class FlowDecomposition:
         #Shape: (B, E, dim, dim)
         mask = torch.eye(dim,dtype=bool,device=self.device)
 
-        ccm = ccm**2
-
         if self.subtract_autocorr:
-            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))**2
+            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))
             if dim > 1:
                 score = 1 + torch.abs(ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
             else:
@@ -281,18 +281,20 @@ class FlowDecomposition:
             else:
                 score = 1 + (-ccm[:,:,0,0]).mean(axis=1)
             return score
-        
+    
     def __compute_h_norm(self):
-        l1 = sum(p.abs().sum() 
-                for p in self.model.parameters() if p.requires_grad)
-        l2 = sum(p.norm(2)
-                for p in self.model.parameters() if p.requires_grad)
-        num_w = torch.tensor(sum(p.numel()
-                for p in self.model.parameters() if p.requires_grad),dtype=MODEL_DTYPE)
+        num_w = torch.tensor(sum(p.numel() 
+                        for p in self.model.parameters() if p.requires_grad), dtype=MODEL_DTYPE)/self.n_comp
+        l1 = torch.stack([p.abs().view(self.proj_dim,self.n_comp, -1).sum(axis=(0,2))
+                for p in self.model.parameters() if p.requires_grad]).squeeze(0)
+        l2 = torch.stack([p.view(self.proj_dim,self.n_comp, -1).norm(2, dim=(0,2))
+                for p in self.model.parameters() if p.requires_grad]).squeeze(0)
+
         h_norm = 1-(torch.sqrt(num_w) - (l1 / (l2 + 1e-6))) / (torch.sqrt(num_w) - 1)
 
+        h_norm = h_norm.mean()  
         return h_norm
-
+    
     def __get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
@@ -321,9 +323,9 @@ class FlowDecomposition:
 
         B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
         
-        r_AB = self.__get_batch_corr(A,B)
+        r_AB = self.__get_batch_distance_corr(A,B)
         return r_AB
-    
+
     def __get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
@@ -373,12 +375,12 @@ class FlowDecomposition:
 
         B = sample_y.unsqueeze(-1).expand(batch_size, sample_size, dim_y, n_comp, n_comp)
         
-        r_AB = self.__get_batch_corr(A,B)
+        r_AB = self.__get_batch_distance_corr(A,B)
         return r_AB
     
     def __get_local_weights(self, lib, sublib, subset_idx, sample_idx, exclusion_rad, theta):
         #[batch, comp, points, proj_dim]
-        dist = torch.cdist(sublib,lib)
+        dist = torch.cdist(sublib,lib,compute_mode="use_mm_for_euclid_dist")
         if theta == None:
             weights = torch.exp(-(dist))
         else:
@@ -393,7 +395,7 @@ class FlowDecomposition:
     def __get_nbrs_indices(self, lib, sublib, n_nbrs, subset_idx, sample_idx, exclusion_rad):
         #[batch, comp, points, proj_dim]
         eps = 1e-6
-        dist = torch.cdist(sublib,lib)
+        dist = torch.cdist(sublib,lib,compute_mode="use_mm_for_euclid_dist")
         exclusion_matrix = torch.where(
             torch.abs(subset_idx.unsqueeze(-2) - sample_idx.unsqueeze(-1)) > exclusion_rad,
             0,
@@ -421,9 +423,20 @@ class FlowDecomposition:
         A = A[:,:,:,None,:].expand(batch_size,-1, E, dim, dim)
         B = B[:,:,:,:,None].expand(batch_size,-1, E, dim, dim)
 
-        r_AB = self.__get_batch_corr(A,B)
+        r_AB = self.__get_batch_distance_corr(A,B)
         return r_AB
     
+    def __get_batch_abs_corr(self, A, B):
+        mean_A = torch.mean(A,axis=1).unsqueeze(1)
+        mean_B = torch.mean(B,axis=1).unsqueeze(1)
+        
+        sum_AB = torch.sum(torch.abs(A - mean_A) * torch.abs(B - mean_B),axis=1)
+        sum_AA = torch.sum(torch.abs(A - mean_A) ** 2,axis=1)
+        sum_BB = torch.sum(torch.abs(B - mean_B) ** 2,axis=1)
+
+        r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
+        return r_AB   
+
     def __get_batch_corr(self, A, B):
         mean_A = torch.mean(A,axis=1).unsqueeze(1)
         mean_B = torch.mean(B,axis=1).unsqueeze(1)
@@ -431,10 +444,11 @@ class FlowDecomposition:
         sum_AB = torch.sum((A - mean_A) * (B - mean_B),axis=1)
         sum_AA = torch.sum((A - mean_A) ** 2,axis=1)
         sum_BB = torch.sum((B - mean_B) ** 2,axis=1)
-        
+
         r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
         return r_AB    
-    
+
+
     def save(self, filepath: str):
         """
         Saves the model, optimizer state, and other attributes to disk.
@@ -498,3 +512,146 @@ class FlowDecomposition:
 
         print(f"Model loaded from {filepath}")
         return new_instance
+    
+    def __get_batch_distance_corr1(self, A, B, eps=1e-8):
+        """
+        Differentiable distance correlation for batches.
+
+        Parameters
+        ----------
+        A, B : torch.Tensor
+            Shape [batch, samples, dim, comp, comp].
+
+        eps : float
+            Small value to avoid division by zero.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [batch, 1, comp, comp].
+        """
+        batch, samples, dim, comp, _ = A.shape
+
+        # flatten to [batch * comp * comp, samples, dim]
+        A_flat = (
+            A.permute(0, 3, 4, 1, 2)
+            .reshape(batch * comp * comp, samples, dim)
+        )
+        B_flat = (
+            B.permute(0, 3, 4, 1, 2)
+            .reshape(batch * comp * comp, samples, dim)
+        )
+
+        def pairwise_distances(X):
+            """Compute pairwise Euclidean distances."""
+            D = torch.cdist(X, X, p=2,compute_mode="use_mm_for_euclid_dist")
+            return D
+
+        def double_center(D):
+            """Double-center distance matrix."""
+            mean_row = D.mean(dim=-1, keepdim=True)
+            mean_col = D.mean(dim=-2, keepdim=True)
+            mean_all = D.mean(dim=(-1, -2), keepdim=True)
+            return D - mean_row - mean_col + mean_all
+
+        # compute pairwise distances
+        A_dist = pairwise_distances(A_flat)
+        B_dist = pairwise_distances(B_flat)
+
+        # double centering
+        A_dc = double_center(A_dist)
+        B_dc = double_center(B_dist)
+
+        # compute dCov and dVar
+        dCov = (A_dc * B_dc).mean(dim=(-1, -2))
+        dVar_A = (A_dc ** 2).mean(dim=(-1, -2))
+        dVar_B = (B_dc ** 2).mean(dim=(-1, -2))
+
+        # calculate distance correlation
+        dCor = dCov / (torch.sqrt(dVar_A * dVar_B) + eps)
+
+        # reshape back to [batch, 1, comp, comp]
+        dCor = dCor.reshape(batch, comp, comp).unsqueeze(1)
+
+        return dCor
+
+    def __get_batch_distance_corr(self, A, B, eps=1e-8):
+        """
+        Differentiable locally weighted distance correlation for batches.
+
+        Parameters
+        ----------
+        A, B : torch.Tensor
+            Shape [batch, samples, dim, comp, comp].
+
+        theta : float
+            Controls the strength of local weighting. Larger theta means stronger locality.
+
+        eps : float
+            Small value to avoid division by zero.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [batch, 1, comp, comp].
+        """
+        batch, samples, dim, comp, _ = A.shape
+
+        # Flatten to [batch * comp * comp, samples, dim]
+        A_flat = (
+            A.permute(0, 3, 4, 1, 2)
+            .reshape(batch * comp * comp, samples, dim)
+        )
+        B_flat = (
+            B.permute(0, 3, 4, 1, 2)
+            .reshape(batch * comp * comp, samples, dim)
+        )
+
+        def pairwise_distances(X):
+            """Compute pairwise Euclidean distances."""
+            return torch.cdist(X, X, p=2, compute_mode="use_mm_for_euclid_dist")
+
+        def compute_weights(D, theta):
+            """Compute local weights for distances."""
+            avg_dist = D.mean(dim=(-1,-2), keepdim=True)
+            weights = torch.exp(-(theta * D / (avg_dist + eps)))
+            return weights
+
+        def double_center1(D, weights):
+            """Weighted double-centering of distance matrix."""
+            weighted_mean_row = (weights * D).sum(dim=-1, keepdim=True) / (weights.sum(dim=-1, keepdim=True) + eps)
+            weighted_mean_col = (weights * D).sum(dim=-2, keepdim=True) / (weights.sum(dim=-2, keepdim=True) + eps)
+            weighted_mean_all = (weights * D).sum(dim=(-1, -2), keepdim=True) / (weights.sum(dim=(-1, -2), keepdim=True) + eps)
+            return D - weighted_mean_row - weighted_mean_col + weighted_mean_all
+
+        def double_center(D):
+            """Double-center distance matrix."""
+            mean_row = D.mean(dim=-1, keepdim=True)
+            mean_col = D.mean(dim=-2, keepdim=True)
+            mean_all = D.mean(dim=(-1, -2), keepdim=True)
+            return D - mean_row - mean_col + mean_all
+        
+        # Compute pairwise distances
+        A_dist = pairwise_distances(A_flat)
+        B_dist = pairwise_distances(B_flat)
+
+        # Compute weights
+        weights_A = compute_weights(A_dist, 1)
+        weights_B = compute_weights(B_dist, 1)
+
+        # Weighted double-centering
+        A_dc = double_center(A_dist)#, weights_A)
+        B_dc = double_center(B_dist)#, weights_B)
+
+        # Compute weighted dCov and dVar
+        dCov = (torch.sqrt(weights_A * weights_B) * A_dc * B_dc).sum(dim=(-1, -2)) / torch.sqrt(weights_A * weights_B).sum(dim=(-1, -2))
+        dVar_A = (weights_A * A_dc**2).sum(dim=(-1, -2)) / (weights_A.sum(dim=(-1, -2)) + eps)
+        dVar_B = (weights_B * B_dc**2).sum(dim=(-1, -2)) / (weights_B.sum(dim=(-1, -2)) + eps)
+
+        # Calculate weighted distance correlation
+        dCor = dCov / (torch.sqrt(dVar_A * dVar_B) + eps)
+
+        # Reshape back to [batch, 1, comp, comp]
+        dCor = dCor.reshape(batch, comp, comp).unsqueeze(1)
+
+        return dCor
