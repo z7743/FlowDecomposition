@@ -76,6 +76,8 @@ class FlowDecomposition:
                                             time_intv, num_rand_samples, batch_size,
                                             optim_policy)
         
+        self.metric_name = metric
+
         if metric == "corr":
             self.metric = self.__get_batch_corr
         elif metric == "dcorr":
@@ -86,6 +88,10 @@ class FlowDecomposition:
             self.metric = self.__get_batch_distance_concordance
         elif metric == "abs_corr":
             self.metric = self.__get_batch_abs_corr
+        elif metric == "hsic":
+            self.metric = self.__get_batch_hsic_rbf
+        elif metric == "cka":
+            self.metric = self.__get_batch_cka_rbf
         else:
             raise ValueError(f"Unknown metric: {metric}")
 
@@ -152,7 +158,7 @@ class FlowDecomposition:
         # Return as a scalar
         return ccm_loss.item()
 
-    def transform(self, X, device="cpu"):
+    def transform_(self, X, device="cpu"):
         """
         Calculates embeddings using the trained model.
         
@@ -166,6 +172,41 @@ class FlowDecomposition:
             inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
             outputs = torch.permute(self.model.to(device)(inputs),dims=(0,2,1)) #Easier to interpret
         return outputs.cpu().numpy()
+    
+    def transform(self, X, device="cpu", pca: bool = False):
+        """
+        Returns embeddings with shape [N, n_components, proj_dim].
+        If pca=True, apply PCA independently for each component along the projection dimension.
+        """
+        with torch.no_grad():
+            inputs = torch.as_tensor(X, dtype=MODEL_DTYPE, device=device)
+
+            # Model outputs [N, D, C]
+            Z_raw = self.model.to(device)(inputs)
+
+            if not pca:
+                # Keep your original transpose: -> [N, C, D]
+                return torch.permute(Z_raw, (0, 2, 1)).cpu().numpy()
+
+            # --- per-component PCA over proj_dim ---
+            N, D, C = Z_raw.shape
+            Zp_raw = torch.empty_like(Z_raw, dtype=torch.float64)  # work in float64 for SVD/eigh
+            Z64 = Z_raw.to(torch.float64)
+
+            for c in range(C):
+                Xc = Z64[:, :, c]                      # [N, D]  (component c)
+                Xc = Xc - Xc.mean(0, keepdim=True)     # center (translation only)
+
+                # Full D×D orthonormal basis via covariance eigendecomposition
+                Ccov = (Xc.T @ Xc) / max(N - 1, 1)     # [D, D]
+                evals, V = torch.linalg.eigh(Ccov)     # columns are eigvecs (ascending)
+                V = V[:, torch.argsort(evals, descending=True)]  # sort by variance desc
+
+                # Scores in PCA coords, shape [N, D]
+                Zp_raw[:, :, c] = (Xc @ V)
+
+            # Back to your public shape: [N, C, D]
+            return torch.permute(Zp_raw.to(Z_raw.dtype), (0, 2, 1)).cpu().numpy()
 
     def _create_dataloader(self, X, sample_size, library_size, 
                        time_intv, num_rand_samples, batch_size, 
@@ -273,9 +314,9 @@ class FlowDecomposition:
             if nbrs_num is None:
                 raise ValueError("`nbrs_num` must be provided when using the 'nrst_nbrs' method.")
             ccm = self.__get_knn_ccm_matrix_approx(
-                subset_idx, sample_idx, 
-                sample_X, sample_y, 
-                subset_X, subset_y, 
+                subset_idx, sample_idx,
+                sample_X, sample_y,
+                subset_X, subset_y,
                 nbrs_num, exclusion_rad
             )
         elif method == "dcorr":
@@ -319,8 +360,8 @@ class FlowDecomposition:
 
         h_norm = h_norm.mean()  
         return h_norm
-    
 
+    
     def __get_dcorr_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
@@ -731,101 +772,51 @@ class FlowDecomposition:
         dCor = dCor.reshape(batch, comp, comp).unsqueeze(1)
 
         return dCor
-
-    def __get_batch_distance_corr_weighted1(
-            self,
-            A: torch.Tensor,a: torch.Tensor,
-            B: torch.Tensor,b: torch.Tensor,
-            theta: float = 1.0,
-            eps: float = 1e-8,
-        ):
+    
+    def __get_batch_hsic_rbf(self, A, B, eps: float = 1e-8, normalized: bool = False):
         """
-        Locally-weighted distance correlation for batched inputs.
-
-        Parameters
-        ----------
-        A, B : torch.Tensor
-            Shape [batch, samples, dim, comp, comp].
-
-        theta : float
-            Controls how fast the weight decays with distance.  
-            Larger theta ⇒ stronger emphasis on near-by samples.
-
-        eps : float
-            Numerical jitter.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape [batch, 1, comp, comp].
+        RBF-HSIC over samples.
+        A,B: [batch, samples, dim, comp, comp] -> returns [batch, 1, comp, comp]
         """
-        batch, samples, dim, comp, _ = a.shape
-        batch, subset, dim, comp, _ = A.shape
+        # Cast to float64 for metric stability
+        A = A.to(dtype=torch.float64)
+        B = B.to(dtype=torch.float64)
 
-        # flatten to [batch * comp * comp, samples, dim]
-        A_flat = (
-            A.permute(0, 3, 4, 1, 2)
-            .reshape(batch * comp * comp, subset, dim)
-        )
+        # Flatten to [N, S, D]
+        A2 = A.permute(0, 3, 4, 1, 2).reshape(-1, A.shape[1], A.shape[2])
+        B2 = B.permute(0, 3, 4, 1, 2).reshape(-1, B.shape[1], B.shape[2])
 
-        a_flat = (
-            a.permute(0, 3, 4, 1, 2)
-            .reshape(batch * comp * comp, samples, dim)
-        )
-        
-        B_flat = (
-            B.permute(0, 3, 4, 1, 2)
-            .reshape(batch * comp * comp, subset, dim)
-        )
+        def rbf_gram(X):
+            D2 = torch.cdist(X, X, p=2, compute_mode="use_mm_for_euclid_dist").pow(2)  # [N,S,S]
+            sigma2 = (D2.mean(dim=(-1, -2), keepdim=True) + eps).detach()
+            #sigma2 = (D2.median(dim=-1, keepdim=True).values
+            #    .median(dim=-2, keepdim=True).values + eps).detach()
+            return torch.exp(-D2 / (2.0 * sigma2))
 
-        b_flat = (
-            b.permute(0, 3, 4, 1, 2)
-            .reshape(batch * comp * comp, samples, dim)
-        )
+        def center(K):
+            mu_r = K.mean(dim=-1, keepdim=True)
+            mu_c = K.mean(dim=-2, keepdim=True)
+            mu_a = K.mean(dim=(-1, -2), keepdim=True)
+            return K - mu_r - mu_c + mu_a
 
-        def pairwise_distances(X,Y):
-            """Pairwise Euclidean distances."""
-            return torch.cdist(
-                X, Y, p=2, compute_mode="use_mm_for_euclid_dist"
-            )
+        K = center(rbf_gram(A2))
+        L = center(rbf_gram(B2))
 
-        def double_center(D):
-            """Gower double-centering."""
-            mean_row = D.mean(dim=-1, keepdim=True)
-            mean_col = D.mean(dim=-2, keepdim=True)
-            mean_all = D.mean(dim=(-1, -2), keepdim=True)
-            return D - mean_row - mean_col + mean_all
+        hsic = (K * L).mean(dim=(-1, -2))  # [N]
 
-        # ── pairwise distances ────────────────────────────────────────────────────
-        A_dist = pairwise_distances(a_flat, A_flat)
-        B_dist = pairwise_distances(b_flat, B_flat)
+        if normalized:
+            kk = (K * K).mean(dim=(-1, -2)) + eps
+            ll = (L * L).mean(dim=(-1, -2)) + eps
+            hsic = hsic / torch.sqrt(kk * ll)
 
-        # You can base the weights on A_dist, B_dist, or any other metric.
-        # Using the symmetric average is a cheap, sensible default:
+        batch, comp = A.shape[0], A.shape[-1]
+        out = hsic.reshape(batch, comp, comp).unsqueeze(1)
+        return out.to(dtype=MODEL_DTYPE)
 
-        # (optionally) set self-weights to zero to ignore diagonal terms
-        # weights = weights.fill_diagonal_(0.)
-        dist_base = B_dist
-        avg_dist = dist_base.mean(dim=(-1, -2), keepdim=True)
-        weights = torch.exp(-theta * dist_base / (avg_dist + eps))
 
-        # ── double centering ─────────────────────────────────────────────────────
-        A_dc = double_center(A_dist)
-        B_dc = double_center(B_dist)
-
-        # ── weighted statistics ──────────────────────────────────────────────────
-        w_sum = weights.sum(dim=(-1, -2), keepdim=False) + eps
-
-        dCov   = (weights * A_dc * B_dc).sum(dim=(-1, -2)) / w_sum
-        dVar_A = (weights * A_dc.pow(2)).sum(dim=(-1, -2)) / w_sum
-        dVar_B = (weights * B_dc.pow(2)).sum(dim=(-1, -2)) / w_sum
-
-        # ── distance correlation ─────────────────────────────────────────────────
-        dCor = dCov / (torch.sqrt(dVar_A * dVar_B) + eps)
-
-        # reshape back to [batch, 1, comp, comp]
-        dCor = dCor.reshape(batch, comp, comp).unsqueeze(1)
-        return dCor
+    def __get_batch_cka_rbf(self, A, B, eps: float = 1e-8):
+        """CKA = normalized HSIC with RBF kernels."""
+        return self.__get_batch_hsic_rbf(A, B, eps=eps, normalized=True)
     
 
     def __get_batch_distance_corr_weighted(
