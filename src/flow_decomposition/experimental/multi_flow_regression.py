@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from flow_decomposition.utils.metrics import get_metric
+
 
 DATA_DTYPE = torch.float32
 MODEL_DTYPE = torch.float32
@@ -11,7 +13,7 @@ MODEL_DTYPE = torch.float32
 class MultiFlowRegression:
 
     def __init__(self, input_dim, proj_dim, n_components,
-                 num_delays=None, delay_step=None, model="linear", subtract_autocorr=False, 
+                 num_delays=None, delay_step=None, model="linear", subtract_autocorr=False,  tol=None,
                  device="cuda",data_device="cpu", optimizer="Adagrad", learning_rate=0.01, random_state=None, verbose=1):
         """
         Initializes the FlowRegression model.
@@ -19,6 +21,7 @@ class MultiFlowRegression:
         Args:
         """
         self.device = device
+        self.input_dim = input_dim
         self.data_device = data_device
         self.random_state = random_state
         self.proj_dim = proj_dim
@@ -28,6 +31,7 @@ class MultiFlowRegression:
         self.subtract_autocorr = subtract_autocorr
         self.loss_history = []
         self.verbose = verbose
+        self.tol = tol
 
         if model == "linear":
             self.model = LinearModel(input_dim=input_dim, proj_dim=proj_dim, n_comp=n_components, device=device,random_state=random_state)
@@ -40,11 +44,15 @@ class MultiFlowRegression:
 
 
         self.component_mixing = torch.nn.Sequential(torch.nn.Linear(n_components, 1, bias=False)).to(device)
+
         self.optimizer = getattr(optim, optimizer)(list(self.model.parameters()) + list(self.component_mixing.parameters()), lr=learning_rate)
 
+        self.metric_name = None
+        self.metric = None
 
     def fit(self, X, Y,
-            sample_size, library_size, exclusion_rad=0, method="knn",
+            sample_size, library_size, exclusion_rad=0, 
+            method="knn",metric="corr",
             theta=None, nbrs_num=None, time_intv=1, 
             num_epochs=100, num_rand_samples=32, batch_size=1, beta=0,
             optim_policy="range"):
@@ -65,7 +73,11 @@ class MultiFlowRegression:
             optim_policy=optim_policy,
             batch_size=batch_size
         )
+
+        self.metric_name = metric
+        self.metric = None if metric == "bce" else get_metric(metric)
         
+        ema = None
         for epoch in range(num_epochs):
             self.optimizer.zero_grad()
             
@@ -74,7 +86,7 @@ class MultiFlowRegression:
             )
             
             h_norm_val = self.__compute_h_norm()
-            total_loss = torch.log(ccm_loss + beta * h_norm_val)
+            total_loss = ccm_loss + beta * h_norm_val
 
             # Backprop and update
             total_loss.backward()
@@ -87,13 +99,28 @@ class MultiFlowRegression:
                     f"h_norm: {h_norm_val.item():.4f}, "
                     f"Total Loss: {total_loss.item():.4f}"
                 )
+
+            
+            if self.tol is not None:
+                cur = total_loss.item()
+                if ema is None:
+                    ema = cur
+                else:
+                    delta = abs(cur - ema)
+                    if delta < self.tol * max(1.0, abs(ema)):
+                        if self.verbose:
+                            print(f"Early-stopped at epoch {epoch+1} "
+                                  f"(Δloss={delta:.3g} < tol={self.tol})")
+                        break
+                    ema = 0.1 * cur + 0.9 * ema
+
             self.loss_history.append(total_loss.item())
 
         if self.random_state is not None:
             torch.set_rng_state(old_rng_state)
 
     def evaluate_loss(self, X_test, Y_test,
-                      sample_size, library_size, exclusion_rad=0, method="knn",
+                      sample_size, library_size, exclusion_rad=0, method="knn",metric="corr",
                       theta=None, nbrs_num=None, time_intv=1, 
                       num_epochs=None, num_rand_samples=32, batch_size=1, beta=None,
                       optim_policy="range"):
@@ -110,6 +137,9 @@ class MultiFlowRegression:
         if self.random_state is not None:
             old_rng_state = torch.get_rng_state()
             torch.manual_seed(self.random_state) #TODO: Not safe for multiple workers
+
+        self.metric_name = metric
+        self.metric = None if metric == "bce" else get_metric(metric)
 
         with torch.no_grad():
             # Create dataloader for test data
@@ -132,20 +162,76 @@ class MultiFlowRegression:
 
         return ccm_loss.item()
 
-    def transform(self, X, device="cpu"):
+    def transform(self, X, device="cpu", pca: bool = False):
         """
-        Calculates embeddings using the trained model.
-        
-        Args:
-            X (numpy.ndarray): Input data.
-        
-        Returns:
-            numpy.ndarray: Decomposed outputs.
+        Returns embeddings with shape [N, n_components, proj_dim].
+        If pca=True, apply PCA independently per component along the projection dimension
+        (same implementation as FlowDecomposition).
         """
         with torch.no_grad():
-            inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
-            outputs = torch.permute(self.model.to(device)(inputs),dims=(0,2,1))
-        return outputs.cpu().numpy()
+            inputs = torch.as_tensor(X, dtype=MODEL_DTYPE, device=device)
+            Z_raw = self.model.to(device)(inputs)            # [N, D, C]
+            if not pca:
+                return torch.permute(Z_raw, (0, 2, 1)).cpu().numpy()
+
+            N, D, C = Z_raw.shape
+            Z64 = Z_raw.to(torch.float64)
+            Zp_raw = torch.empty_like(Z64)
+            for c in range(C):
+                Xc = Z64[:, :, c]
+                Xc = Xc - Xc.mean(0, keepdim=True)
+                Ccov = (Xc.T @ Xc) / max(N - 1, 1)
+                evals, V = torch.linalg.eigh(Ccov)
+                V = V[:, torch.argsort(evals, descending=True)]
+                Zp_raw[:, :, c] = Xc @ V
+            return torch.permute(Zp_raw.to(Z_raw.dtype), (0, 2, 1)).cpu().numpy()
+
+    def save(self, filepath: str):
+        init_params = {
+            "input_dim": self.input_dim,               
+            "proj_dim": self.proj_dim,
+            "n_components": self.n_comp_x,
+            "num_delays": self.num_delays,
+            "delay_step": self.delay_step,
+            "model": "linear" if isinstance(self.model, LinearModel) else (
+                     "nonlinear" if isinstance(self.model, NonlinearModel) else "custom"),
+            "subtract_autocorr": self.subtract_autocorr,
+            "regularizer": self.regularizer,
+            "tol": self.tol,
+            "device": self.device,
+            "data_device": self.data_device,
+            "optimizer": type(self.optimizer).__name__,
+            "learning_rate": self.optimizer.param_groups[0]['lr'],
+            "random_state": self.random_state,
+        }
+        checkpoint = {
+            "init_params": init_params,
+            "model_state": self.model.state_dict(),
+            "mix_state": self.component_mixing.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "loss_history": self.loss_history,
+        }
+        torch.save(checkpoint, filepath)
+        if self.verbose:
+            print(f"MultiFlowRegression saved to {filepath}")
+
+    @classmethod
+    def load(cls, filepath: str, map_location: str = "cpu"):
+        checkpoint = torch.load(filepath, map_location=map_location)
+        init_params = checkpoint["init_params"]
+        init_params["device"] = map_location
+        init_params["data_device"] = map_location
+
+        new = cls(**init_params)
+
+        new.model.load_state_dict(checkpoint["model_state"])
+        new.component_mixing.load_state_dict(checkpoint["mix_state"])
+        new.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        new.loss_history = checkpoint.get("loss_history", [])
+        print(f"MultiFlowRegression loaded from {filepath}")
+        return new
+
+
 
     def _create_dataloader(self, X, Y, sample_size, library_size,
                            time_intv, num_rand_samples, optim_policy, batch_size):
@@ -287,10 +373,10 @@ class MultiFlowRegression:
     def _get_knn_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
         A, B = self._get_knn_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad)
         
-        r_AB = self.neg_cross_entropy_per_dim(A,B)
+        r_AB = self.__get_batch_corr(A,B)
         return r_AB
     
-    def _get_knn_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
+    def _get_knn_prediction1(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, nbrs_num, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp_x = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
         _, _, dim_y, n_comp_y = sample_y.shape
@@ -336,13 +422,50 @@ class MultiFlowRegression:
 
         return A, B
     
+    def _get_knn_prediction(self, subset_idx, sample_idx,
+                            sample_X, sample_y,
+                            subset_X, subset_y,
+                            nbrs_num, exclusion_rad):
+        """
+        Diagonal kNN: component i in X predicts y[:, :, i, :]
+        Returns:
+        if metric=="bce":  A,B -> [B, S, Dy, Cy]
+        else (corr):       A,B -> [B, S, Dy, Cy]  (scored per component later)
+        """
+        B, S, Dx, Cx = sample_X.shape
+        _, L, Dy, Cy = subset_y.shape
+        if Dy != Cx:
+            raise ValueError(f"Diagonal mapping requires Y.shape[2] (Dy) == n_components (got Dy={Dy}, Cx={Cx}).")
+
+        # Distances per X component
+        sample_X_t = sample_X.permute(0, 3, 1, 2)   # [B, Cx, S, Dx]
+        subset_X_t = subset_X.permute(0, 3, 1, 2)   # [B, Cx, L, Dx]
+        weights, indices = self.__get_nbrs_indices(subset_X_t, sample_X_t, nbrs_num,
+                                                subset_idx, sample_idx, exclusion_rad)   # [B,Cx,S,K], [B,Cx,S,K]
+
+        # For each comp i, gather y at dimension i
+        # subset_y: [B, L, Dy, Cy] -> [B, Dy, L, Cy]
+        suby = subset_y.permute(0, 2, 1, 3)  # [B, Dy, L, Cy]
+        bidx = torch.arange(B, device=self.device).view(B, 1, 1, 1)
+        cidx = torch.arange(Cx, device=self.device).view(1, Cx, 1, 1)
+
+        # Gather over L using per-comp indices -> [B, Cx, S, K, Cy]
+        gathered = suby[bidx, cidx, indices, :]
+        w = weights.unsqueeze(-1)                     # [B, Cx, S, K, 1]
+        pred = (gathered * w).sum(dim=3)              # [B, Cx, S, Cy]
+
+        # Place into [B, S, Dy, Cy] with Dy==Cx
+        A = pred.permute(0, 2, 1, 3)                  # [B, S, Dy, Cy]
+        B_true = sample_y                              # [B, S, Dy, Cy]
+        return A, B_true
+    
     def _get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         A, B = self._get_smap_prediction(subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad)
         
-        r_AB = self.neg_cross_entropy_per_dim(A,B)
+        r_AB = self.__get_batch_corr(A,B)
         return r_AB
 
-    def _get_smap_prediction(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
+    def _get_smap_prediction1(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp_x = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
         _, _, dim_y, n_comp_y = sample_y.shape
@@ -398,6 +521,53 @@ class MultiFlowRegression:
         
         return A, B
     
+    def _get_smap_prediction(self, subset_idx, sample_idx,
+                            sample_X, sample_y,
+                            subset_X, subset_y,
+                            theta, exclusion_rad):
+        """
+        Diagonal SMAP: component i in X predicts y[:, :, i, :]
+        Returns A,B with shape [B, S, Dy, Cy] (Dy==n_components)
+        """
+        B, S, Dx, Cx = sample_X.shape
+        _, L, Dy, Cy = subset_y.shape
+        if Dy != Cx:
+            raise ValueError(f"Diagonal mapping requires Y.shape[2] (Dy) == n_components (got Dy={Dy}, Cx={Cx}).")
+
+        # [B, Cx, S, Dx] / [B, Cx, L, Dx]
+        sample_X_t = sample_X.permute(0, 3, 1, 2)
+        subset_X_t = subset_X.permute(0, 3, 1, 2)
+        weights = self.__get_local_weights(subset_X_t, sample_X_t,
+                                        subset_idx, sample_idx, exclusion_rad, theta)     # [B, Cx, S, L]
+
+        # Build weighted local linear models per (comp i, sample s), predict y_dim=i (all channels Cy)
+        # Design matrices
+        W = weights.reshape(B * Cx * S, L, 1)                                                 # [B*Cx*S, L, 1]
+        X = subset_X_t.reshape(B * Cx, L, Dx).unsqueeze(2).expand(B * Cx, L, S, Dx)\
+                    .reshape(B * Cx * S, L, Dx)                                            # [B*Cx*S, L, Dx]
+
+        # Target Y: take y_dim == comp i
+        suby = subset_y.permute(0, 2, 1, 3)                                                   # [B, Dy, L, Cy]
+        # repeat along S and pack -> [B*Cx*S, L, Cy]
+        Y = suby[:, torch.arange(Cx, device=self.device)].permute(1, 0, 2, 3)\
+            .reshape(Cx, B, L, Cy).permute(1, 0, 2, 3)\
+            .unsqueeze(2).expand(B, Cx, S, L, Cy).reshape(B * Cx * S, L, Cy)
+
+        X1 = torch.cat([torch.ones((B * Cx * S, L, 1), device=self.device), X], dim=2)        # [*, L, Dx+1]
+        Xw, Yw = X1 * W, Y * W
+        XTWX = torch.bmm(Xw.transpose(1, 2), Xw)                                              # [*, Dx+1, Dx+1]
+        XTWy = torch.bmm(Xw.transpose(1, 2), Yw)                                              # [*, Dx+1, Cy]
+        eye = torch.eye(XTWX.size(-1), device=XTWX.device) * 1e-6
+        beta = torch.bmm(torch.inverse(XTWX + eye), XTWy)                                     # [*, Dx+1, Cy]
+
+        Xq = torch.cat([torch.ones((B * Cx * S, 1), device=self.device),
+                        sample_X_t.reshape(B * Cx, S, Dx).reshape(B * Cx * S, Dx)], dim=1)\
+                        .reshape(B * Cx * S, 1, Dx + 1)                                       # [*, 1, Dx+1]
+        pred = torch.bmm(Xq, beta).reshape(B, Cx, S, Cy)                                      # [B, Cx, S, Cy]
+        A = pred.permute(0, 2, 1, 3)                                                          # [B, S, Dy, Cy]
+        B_true = sample_y
+        return A, B_true
+
     def __get_local_weights(self, lib, sublib, subset_idx, sample_idx, exclusion_rad, theta):
         #[batch, comp, points, proj_dim]
         dist = torch.cdist(sublib,lib)
@@ -457,7 +627,7 @@ class MultiFlowRegression:
         r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
         return r_AB    
 
-    def neg_cross_entropy_per_dim(self, A, B):
+    def __neg_cross_entropy_per_dim(self, A, B):
         A_clamped = A.clamp(min=1e-7, max=1. - 1e-7)
         elementwise_loss = F.binary_cross_entropy(
             A_clamped, B.float(), reduction="none"

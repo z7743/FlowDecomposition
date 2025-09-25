@@ -1,5 +1,6 @@
 from flow_decomposition.utils.models import LinearModel, NonlinearModel
 from flow_decomposition.utils.data_samplers import RandomSampleSubsetPairDataset
+from flow_decomposition.utils.metrics import get_metric
 
 import torch
 import torch.optim as optim
@@ -77,23 +78,7 @@ class FlowDecomposition:
                                             optim_policy)
         
         self.metric_name = metric
-
-        if metric == "corr":
-            self.metric = self.__get_batch_corr
-        elif metric == "dcorr":
-            self.metric = self.__get_batch_distance_corr
-        elif metric == "ccc":
-            self.metric = self.__get_batch_ccc
-        elif metric == "dccc":
-            self.metric = self.__get_batch_distance_concordance
-        elif metric == "abs_corr":
-            self.metric = self.__get_batch_abs_corr
-        elif metric == "hsic":
-            self.metric = self.__get_batch_hsic_rbf
-        elif metric == "cka":
-            self.metric = self.__get_batch_cka_rbf
-        else:
-            raise ValueError(f"Unknown metric: {metric}")
+        self.metric = get_metric(metric) 
 
         for epoch in range(num_epochs):
             self.optimizer.zero_grad()
@@ -157,21 +142,6 @@ class FlowDecomposition:
             torch.set_rng_state(old_rng_state)
         # Return as a scalar
         return ccm_loss.item()
-
-    def transform_(self, X, device="cpu"):
-        """
-        Calculates embeddings using the trained model.
-        
-        Args:
-            X (numpy.ndarray): Input data.
-        
-        Returns:
-            numpy.ndarray: Decomposed outputs.
-        """
-        with torch.no_grad():
-            inputs = torch.tensor(X, dtype=MODEL_DTYPE,device=device)
-            outputs = torch.permute(self.model.to(device)(inputs),dims=(0,2,1)) #Easier to interpret
-        return outputs.cpu().numpy()
     
     def transform(self, X, device="cpu", pca: bool = False):
         """
@@ -335,9 +305,15 @@ class FlowDecomposition:
         mask = torch.eye(dim,dtype=bool,device=self.device)
 
         if self.subtract_autocorr:
-            corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))
+            #corr = torch.abs(self.__get_autoreg_matrix_approx(sample_X,sample_y))
+
+            #corr = (self.__get_autoreg_matrix_approx(sample_X,sample_y))
+            corr = torch.abs(self.__get_autoreg_matrix_approx(subset_X, subset_y, sample_X, sample_y))
+            #print(torch.stack([(corr[:,:,mask]).mean(axis=(1,2)).detach(),(ccm[:,:,mask]).mean(axis=(1,2)).detach()]).T)
+            #print(ccm.mean(axis=(1))[0].detach())
             if dim > 1:
                 score = 1 + (ccm[:,:,~mask]).mean(axis=(1,2)) - (ccm[:,:,mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2))
+                #score = ((ccm[:,:,~mask]).mean(axis=(1,2)) + (corr[:,:,mask]).mean(axis=(1,2)))/(2 * ccm[:,:,mask]).mean(axis=(1,2))
             else:
                 score = 1 + (-ccm[:,:,0,0] + corr[:,:,0,0]).mean(axis=1)
             return score
@@ -352,16 +328,19 @@ class FlowDecomposition:
         num_w = torch.tensor(sum(p.numel() 
                         for p in self.model.parameters() if p.requires_grad), dtype=MODEL_DTYPE)/self.n_comp
         l1 = torch.stack([p.abs().view(self.proj_dim,self.n_comp, -1).sum(axis=(0,2))
-                for p in self.model.parameters() if p.requires_grad]).squeeze(0)
+                for p in self.model.parameters() if p.requires_grad]).squeeze(0)    
         l2 = torch.stack([p.view(self.proj_dim,self.n_comp, -1).norm(2, dim=(0,2))
                 for p in self.model.parameters() if p.requires_grad]).squeeze(0)
 
         h_norm = 1-(torch.sqrt(num_w) - (l1 / (l2 + 1e-6))) / (torch.sqrt(num_w) - 1)
 
+
+        #r = l2 + 1e-6
+        #r = r.detach()           
+        #h_norm = (r ** 1) * h_norm
         h_norm = h_norm.mean()  
         return h_norm
 
-    
     def __get_dcorr_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
@@ -410,7 +389,102 @@ class FlowDecomposition:
         r_AB = self.metric(A,B)
         return r_AB
 
-    def __get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad):
+    def __get_knnloao_ccm_matrix_approx1(
+        self,
+        subset_idx, sample_idx,
+        sample_X, sample_y,
+        subset_X, subset_y,
+        nbrs_num, exclusion_rad
+    ):
+        """
+        LOAO KNN-CCM approximation.
+
+        Shapes (same as your current method):
+        sample_X: [B, S, dim_x, n_comp]
+        subset_X: [B, T, dim_x, n_comp]
+        sample_y: [B, S, dim_y, n_comp]
+        subset_y: [B, T, dim_y, n_comp]
+
+        Returns:
+        r_AB: [B, 1, n_comp, n_comp]
+        """
+
+        device = self.device
+
+        Bsz, S, dim_x, n_comp = sample_X.shape
+        _,  T, _, _            = subset_X.shape
+        _, _, dim_y, _         = sample_y.shape
+
+        # --- 1) Base (full-dim) KNN for all pairs; we'll keep off-diagonals from this ---
+        sample_X_t = sample_X.permute(0, 3, 1, 2)  # [B, n_comp, S, dim_x]
+        subset_X_t = subset_X.permute(0, 3, 1, 2)  # [B, n_comp, T, dim_x]
+
+        weights_full, indices_full = self.__get_nbrs_indices(
+            subset_X_t, sample_X_t, nbrs_num, subset_idx, sample_idx, exclusion_rad
+        )  # [B, n_comp, S, K]
+
+        batch_idx = torch.arange(Bsz, device=device).view(Bsz, 1, 1, 1)  # [B,1,1,1]
+        selected_full = subset_y[batch_idx, indices_full, :, :]          # [B, n_comp, S, K, dim_y, n_comp]
+
+        # shape -> [B, S, dim_y, K, n_comp(tgt), n_comp(src)]
+        result_full = selected_full.permute(0, 2, 4, 3, 5, 1)
+
+        # weights -> [B, S, 1, K, 1, n_comp(src)]
+        w_full = weights_full.permute(0, 2, 3, 1).unsqueeze(2).unsqueeze(-2)
+
+        # A_full: [B, S, dim_y, n_comp(tgt), n_comp(src)]
+        A_full = (result_full * w_full).sum(dim=3)
+
+        # Start from full predictions; we'll overwrite the diagonal with LOAO results.
+        A = A_full.clone()
+
+        # --- 2) LOAO for diagonal (i == j): repeat for every input axis d ---
+        # We only overwrite A[:, :, d, i, i] using neighbors computed without axis d.
+        # (If dim_y != dim_x, we only fill the min(dim_x, dim_y) leading dims.)
+        nd_fill = min(dim_x, dim_y)
+
+        for d in range(nd_fill):
+            # Zero out axis d to "remove" it from distance computations.
+            # (Zeroing in both query and candidate sets makes that axis contribute 0 to all pairwise distances.)
+            sample_X_mask = sample_X_t.clone()
+            subset_X_mask = subset_X_t.clone()
+            sample_X_mask[..., d] = 0.0
+            subset_X_mask[..., d] = 0.0
+
+            weights_d, indices_d = self.__get_nbrs_indices(
+                subset_X_mask, sample_X_mask, nbrs_num, subset_idx, sample_idx, exclusion_rad
+            )  # [B, n_comp, S, K]
+
+            # Gather ONLY the d-th output dimension for efficiency: [:, :, :, :, d:d+1, :]
+            selected_d = subset_y[batch_idx, indices_d, d:d+1, :]  # [B, n_comp, S, K, 1, n_comp]
+
+            # -> [B, S, 1, K, n_comp(tgt), n_comp(src)]
+            result_d = selected_d.permute(0, 2, 4, 3, 5, 1)
+
+            # weights -> [B, S, 1, K, 1, n_comp(src)]
+            w_d = weights_d.permute(0, 2, 3, 1).unsqueeze(2).unsqueeze(-2)
+
+            # A_d_full: [B, S, 1, n_comp(tgt), n_comp(src)]
+            A_d_full = (result_d * w_d).sum(dim=3)
+
+            # We only want diagonal (i==j): take diag over the last two dims.
+            # A_d_diag: [B, S, 1, n_comp]  (value for each component i on its own diagonal slot)
+            A_d_diag = A_d_full.diagonal(offset=0, dim1=3, dim2=4)  # diag over (tgt, src)
+
+            # Write into A[:, :, d, i, i] for all i.
+            # Loop is simple & safe (avoids tricky advanced-index assign semantics).
+            for i in range(n_comp):
+                # A_d_diag[..., i] is [B, S, 1]
+                A[:, :, d, i, i] = A_d_diag[..., i].squeeze(-1)
+
+        # --- 3) Compare to ground truth and return ---
+        # B: [B, S, dim_y, n_comp, n_comp] (broadcasted along last axis)
+        B = sample_y.unsqueeze(-1).expand(Bsz, S, dim_y, n_comp, n_comp)
+
+        r_AB = self.metric(A, B)  # [B, 1, n_comp, n_comp]
+        return r_AB
+
+    def __get_smap_ccm_matrix_approx(self, subset_idx, sample_idx, sample_X, sample_y, subset_X, subset_y, theta, exclusion_rad,ridge=0.0):
         batch_size, sample_size, dim_x, n_comp = sample_X.shape
         _, subset_size, _, _ = subset_X.shape
         _, _, dim_y, _ = sample_y.shape
@@ -445,6 +519,11 @@ class FlowDecomposition:
 
         XTWX = torch.bmm(X_intercept_weighted.transpose(1, 2), X_intercept_weighted)
         XTWy = torch.bmm(X_intercept_weighted.transpose(1, 2), Y_weighted)
+        if ridge and ridge > 0.0:
+            I = torch.eye(dim_x + 1, device=XTWX.device, dtype=XTWX.dtype).unsqueeze(0).expand(XTWX.size(0), -1, -1)
+            I = I.clone()
+            I[:, 0, 0] = 0.0
+            XTWX = XTWX + ridge * I
         beta = torch.bmm(torch.inverse(XTWX), XTWy)
         #Shape: [batch * comp{y} * comp{x} * sample_size, dim_x + 1, dim_y]
 
@@ -497,7 +576,7 @@ class FlowDecomposition:
 
         return weights, indices
     
-    def __get_autoreg_matrix_approx(self, A, B):
+    def __get_autoreg_matrix_approx1(self, A, B):
         batch_size, _, _, dim = A.shape
         if self.use_delay:
             E = self.proj_dim * self.num_delays
@@ -510,142 +589,62 @@ class FlowDecomposition:
         r_AB = self.metric(A,B)
         return r_AB
     
-    def __get_batch_abs_corr(self, A, B):
-        mean_A = torch.mean(A,axis=1).unsqueeze(1)
-        mean_B = torch.mean(B,axis=1).unsqueeze(1)
-        
-        sum_AB = torch.sum(torch.abs(A - mean_A) * torch.abs(B - mean_B),axis=1)
-        sum_AA = torch.sum(torch.abs(A - mean_A) ** 2,axis=1)
-        sum_BB = torch.sum(torch.abs(B - mean_B) ** 2,axis=1)
-
-        r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
-        return r_AB   
-
-    def __get_batch_corr(self, A, B):
-        mean_A = torch.mean(A,axis=1).unsqueeze(1)
-        mean_B = torch.mean(B,axis=1).unsqueeze(1)
-        
-        sum_AB = torch.sum((A - mean_A) * (B - mean_B),axis=1)
-        sum_AA = torch.sum((A - mean_A) ** 2,axis=1)
-        sum_BB = torch.sum((B - mean_B) ** 2,axis=1)
-
-        r_AB = sum_AB / torch.sqrt(sum_AA * sum_BB)
-        return r_AB    
-    
-    def __get_batch_ccc(self, A: torch.Tensor, B: torch.Tensor, eps: float = 1e-12, unbiased: bool = True):
+    def __get_autoreg_matrix_approx(self,
+                            subset_X, subset_y,
+                            sample_X, sample_y,
+                            ridge: float = 0.0,
+                            use_intercept: bool = True):
         """
-        Concordance Correlation Coefficient (Lin's CCC) between A and B.
-
-        Parameters
-        ----------
-        A, B : torch.Tensor
-            Shape [batch, samples, dim, comp, comp].
-
-        Returns
-        -------
-        torch.Tensor
-            Shape [batch, 1, comp, comp].
+        Fit global linear map on the LIBRARY, predict the SAMPLES.
+        Shapes:
+        subset_X: [B, L, Dx, Cx]
+        subset_y: [B, L, Dy, Cy]
+        sample_X: [B, S, Dx, Cx]
+        sample_y: [B, S, Dy, Cy]
+        Returns: [B, 1, Cy, Cx] via self.metric(pred, sample_y)
         """
-        # Flatten samples and dim -> observations axis
-        # Resulting shape: [batch, N, comp, comp], where N = samples * dim
-        A2 = A.flatten(start_dim=1, end_dim=2)
-        B2 = B.flatten(start_dim=1, end_dim=2)
-        N = A2.shape[1]
+        Bch, L, Dx, Cx = subset_X.shape
+        _,  _, Dy, Cy = subset_y.shape
+        S = sample_X.shape[1]
 
-        # Means along observations
-        mu_A = A2.mean(dim=1, keepdim=True)            # [batch, 1, comp, comp]
-        mu_B = B2.mean(dim=1, keepdim=True)            # [batch, 1, comp, comp]
+        # Train design: [B, Cx, L, Dx], Targets: [B, Cy, L, Dy]
+        Xtr = subset_X.permute(0, 3, 1, 2)
+        Ytr = subset_y.permute(0, 3, 1, 2)
 
-        # Variances and covariance along observations
-        if unbiased and N > 1:
-            var_A = ((A2 - mu_A) ** 2).sum(dim=1, keepdim=True) / (N - 1)
-            var_B = ((B2 - mu_B) ** 2).sum(dim=1, keepdim=True) / (N - 1)
-            cov_AB = (((A2 - mu_A) * (B2 - mu_B)).sum(dim=1, keepdim=True)) / (N - 1)
+        if use_intercept:
+            ones_tr = torch.ones(Bch, Cx, L, 1, device=subset_X.device, dtype=subset_X.dtype)
+            Xtr = torch.cat([ones_tr, Xtr], dim=-1)
+            Dx1 = Dx + 1
         else:
-            var_A = ((A2 - mu_A) ** 2).mean(dim=1, keepdim=True)
-            var_B = ((B2 - mu_B) ** 2).mean(dim=1, keepdim=True)
-            cov_AB = ((A2 - mu_A) * (B2 - mu_B)).mean(dim=1, keepdim=True)
+            Dx1 = Dx
 
-        # Lin's CCC
-        denom = var_A + var_B + (mu_A - mu_B).pow(2)
-        ccc = (2.0 * cov_AB) / (denom + eps)           # [batch, 1, comp, comp]
+        # Normal equations per (Cy, Cx)
+        XtX = torch.matmul(Xtr.transpose(-2, -1), Xtr)  # [B, Cx, Dx1, Dx1]
+        if ridge > 0:
+            I = torch.eye(Dx1, device=Xtr.device, dtype=Xtr.dtype).view(1,1,Dx1,Dx1)
+            XtX = XtX + ridge * I
 
-        return ccc
-    
-    def __get_batch_distance_concordance(self, A, B, eps: float = 1e-8, signed: bool = False):
-        """
-        Distance Concordance Correlation Coefficient (dCCC) between A and B.
-        An analog of Lin's CCC using distance covariance/variance plus a mean-difference penalty.
+        XtY = torch.matmul(                                   # [B, Cy, Cx, Dx1, Dy]
+            Xtr.transpose(-2, -1).unsqueeze(1),               # [B, 1,  Cx, Dx1, L]
+            Ytr.unsqueeze(2)                                  # [B, Cy, 1,  L,   Dy]
+        )
+        W = torch.linalg.solve(                               # [B, Cy, Cx, Dx1, Dy]
+            XtX.unsqueeze(1).expand(-1, Cy, -1, -1, -1),
+            XtY
+        )
 
-        Parameters
-        ----------
-        A, B : torch.Tensor
-            Shape [batch, samples, dim, comp, comp].
-        eps : float
-            Numerical stability.
-        signed : bool
-            If True, multiply by the sign of (Pearson) correlation between A and B
-            so the coefficient can be negative for anti-concordance.
+        # Predict on samples
+        Xte = sample_X.permute(0, 3, 1, 2)                    # [B, Cx, S, Dx]
+        if use_intercept:
+            ones_te = torch.ones(Bch, Cx, S, 1, device=sample_X.device, dtype=sample_X.dtype)
+            Xte = torch.cat([ones_te, Xte], dim=-1)          # [B, Cx, S, Dx1]
 
-        Returns
-        -------
-        torch.Tensor
-            Shape [batch, 1, comp, comp].
-        """
-        import torch
-        batch, samples, dim, comp, _ = A.shape
-        device = A.device
-        dtype = A.dtype
+        Y_hat = torch.matmul(Xte.unsqueeze(1), W)             # [B, Cy, Cx, S, Dy]
 
-        # Flatten to [batch*comp*comp, samples, dim]
-        A_flat = A.permute(0, 3, 4, 1, 2).reshape(batch * comp * comp, samples, dim)
-        B_flat = B.permute(0, 3, 4, 1, 2).reshape(batch * comp * comp, samples, dim)
-
-        # Sample means across the "observations" axis (samples)
-        mu_A = A_flat.mean(dim=1)                         # [N, dim]
-        mu_B = B_flat.mean(dim=1)                         # [N, dim]
-        mean_diff_sq = (mu_A - mu_B).pow(2).sum(dim=1)    # [N]
-
-        # Pairwise distances and double-centering (same as your dCor)
-        def pairwise_distances(X):
-            return torch.cdist(X, X, p=2, compute_mode="use_mm_for_euclid_dist")  # [N, samples, samples]
-
-        def double_center(D):
-            mean_row = D.mean(dim=-1, keepdim=True)
-            mean_col = D.mean(dim=-2, keepdim=True)
-            mean_all = D.mean(dim=(-1, -2), keepdim=True)
-            return D - mean_row - mean_col + mean_all
-
-        A_dc = double_center(pairwise_distances(A_flat))
-        B_dc = double_center(pairwise_distances(B_flat))
-
-        # Distance covariance/variance (biased, differentiable, nonnegative up to num. noise)
-        dCov   = (A_dc * B_dc).mean(dim=(-1, -2))         # [N]
-        dVar_A = (A_dc.pow(2)).mean(dim=(-1, -2))         # [N]
-        dVar_B = (B_dc.pow(2)).mean(dim=(-1, -2))         # [N]
-
-        # dCCC numerator/denominator
-        denom = dVar_A + dVar_B + mean_diff_sq + eps       # [N]
-        dccc = (2.0 * dCov) / denom                        # [N]
-
-        # Optional signed version (attach a sign like CCC can be negative)
-        if signed:
-            A0 = A_flat - mu_A.unsqueeze(1)                # [N, samples, dim]
-            B0 = B_flat - mu_B.unsqueeze(1)
-            num = (A0 * B0).mean(dim=(1, 2))               # inner product mean
-            den = torch.sqrt(A0.pow(2).mean(dim=(1, 2)) * B0.pow(2).mean(dim=(1, 2)) + eps)
-            sign = torch.sign(num / den)                   # [-1, 0, 1]
-            dccc = dccc * sign
-
-        # Handle degenerate identical-constant case: define dCCC=1
-        deg = (dVar_A + dVar_B + mean_diff_sq) < eps
-        if torch.any(deg):
-            dccc = dccc.clone()
-            dccc[deg] = torch.tensor(1.0, dtype=dtype, device=device)
-
-        # Reshape back to [batch, 1, comp, comp]
-        dccc = dccc.reshape(batch, comp, comp).unsqueeze(1)
-        return dccc
+        # Score with the same metric as CCM: expects [B, S, D, C, C]
+        B_pred = Y_hat.permute(0, 3, 4, 1, 2)                 # [B, S, Dy, Cy, Cx]
+        B_true = sample_y.unsqueeze(-1).expand(Bch, S, Dy, Cy, Cx)
+        return self.metric(B_pred, B_true)                    # [B, 1, Cy, Cx]
 
     def save(self, filepath: str):
         """
@@ -710,113 +709,6 @@ class FlowDecomposition:
 
         print(f"Model loaded from {filepath}")
         return new_instance
-    
-    def __get_batch_distance_corr(self, A, B, eps=1e-8):
-        """
-        Differentiable distance correlation for batches.
-
-        Parameters
-        ----------
-        A, B : torch.Tensor
-            Shape [batch, samples, dim, comp, comp].
-
-        eps : float
-            Small value to avoid division by zero.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape [batch, 1, comp, comp].
-        """
-        batch, samples, dim, comp, _ = A.shape
-
-        # flatten to [batch * comp * comp, samples, dim]
-        A_flat = (
-            A.permute(0, 3, 4, 1, 2)
-            .reshape(batch * comp * comp, samples, dim)
-        )
-        B_flat = (
-            B.permute(0, 3, 4, 1, 2)
-            .reshape(batch * comp * comp, samples, dim)
-        )
-
-        def pairwise_distances(X):
-            """Compute pairwise Euclidean distances."""
-            D = torch.cdist(X, X, p=2,compute_mode="use_mm_for_euclid_dist")
-            return D
-
-        def double_center(D):
-            """Double-center distance matrix."""
-            mean_row = D.mean(dim=-1, keepdim=True)
-            mean_col = D.mean(dim=-2, keepdim=True)
-            mean_all = D.mean(dim=(-1, -2), keepdim=True)
-            return D - mean_row - mean_col + mean_all
-
-        # compute pairwise distances
-        A_dist = pairwise_distances(A_flat)
-        B_dist = pairwise_distances(B_flat)
-
-        # double centering
-        A_dc = double_center(A_dist)
-        B_dc = double_center(B_dist)
-    
-        # compute dCov and dVar
-        dCov = (A_dc * B_dc).mean(dim=(-1, -2))
-        dVar_A = (A_dc ** 2).mean(dim=(-1, -2))
-        dVar_B = (B_dc ** 2).mean(dim=(-1, -2))
-
-        # calculate distance correlation
-        dCor = dCov / (torch.sqrt(dVar_A * dVar_B) + eps)
-
-        # reshape back to [batch, 1, comp, comp]
-        dCor = dCor.reshape(batch, comp, comp).unsqueeze(1)
-
-        return dCor
-    
-    def __get_batch_hsic_rbf(self, A, B, eps: float = 1e-8, normalized: bool = False):
-        """
-        RBF-HSIC over samples.
-        A,B: [batch, samples, dim, comp, comp] -> returns [batch, 1, comp, comp]
-        """
-        # Cast to float64 for metric stability
-        A = A.to(dtype=torch.float64)
-        B = B.to(dtype=torch.float64)
-
-        # Flatten to [N, S, D]
-        A2 = A.permute(0, 3, 4, 1, 2).reshape(-1, A.shape[1], A.shape[2])
-        B2 = B.permute(0, 3, 4, 1, 2).reshape(-1, B.shape[1], B.shape[2])
-
-        def rbf_gram(X):
-            D2 = torch.cdist(X, X, p=2, compute_mode="use_mm_for_euclid_dist").pow(2)  # [N,S,S]
-            sigma2 = (D2.mean(dim=(-1, -2), keepdim=True) + eps).detach()
-            #sigma2 = (D2.median(dim=-1, keepdim=True).values
-            #    .median(dim=-2, keepdim=True).values + eps).detach()
-            return torch.exp(-D2 / (2.0 * sigma2))
-
-        def center(K):
-            mu_r = K.mean(dim=-1, keepdim=True)
-            mu_c = K.mean(dim=-2, keepdim=True)
-            mu_a = K.mean(dim=(-1, -2), keepdim=True)
-            return K - mu_r - mu_c + mu_a
-
-        K = center(rbf_gram(A2))
-        L = center(rbf_gram(B2))
-
-        hsic = (K * L).mean(dim=(-1, -2))  # [N]
-
-        if normalized:
-            kk = (K * K).mean(dim=(-1, -2)) + eps
-            ll = (L * L).mean(dim=(-1, -2)) + eps
-            hsic = hsic / torch.sqrt(kk * ll)
-
-        batch, comp = A.shape[0], A.shape[-1]
-        out = hsic.reshape(batch, comp, comp).unsqueeze(1)
-        return out.to(dtype=MODEL_DTYPE)
-
-
-    def __get_batch_cka_rbf(self, A, B, eps: float = 1e-8):
-        """CKA = normalized HSIC with RBF kernels."""
-        return self.__get_batch_hsic_rbf(A, B, eps=eps, normalized=True)
     
 
     def __get_batch_distance_corr_weighted(

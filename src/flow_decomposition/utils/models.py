@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import init
 
 class BaseDecompositionModel(nn.Module):
     """
@@ -73,7 +74,7 @@ class BaseRegressionModel(nn.Module):
         raise NotImplementedError("Subclasses must implement this method.")  
     
         
-class LinearModel(nn.Module):
+class LinearModel_(nn.Module):
     def __init__(self, input_dim, proj_dim, n_comp, device="cuda", dtype=torch.float32, random_state=None):
         """
         Initializes the linear projection module.
@@ -114,6 +115,59 @@ class LinearModel(nn.Module):
             numpy.ndarray: Weights of the model reshaped and permuted.
         """
         return torch.permute(self.model.weight.T.reshape(-1,self.proj_dim,self.n_comp), dims=(0,2,1)).cpu().detach().numpy()
+
+
+class BlockOrthoLinear(nn.Linear):
+    """
+    nn.Linear whose rows are kept orthonormal in blocks of size (proj_dim).
+    After every optimiser step call .orthonormalise().
+    """
+    def __init__(self, in_features, proj_dim, n_comp, **kwargs):
+        super().__init__(in_features, n_comp * proj_dim, bias=False, **kwargs)
+        self.proj_dim = proj_dim
+        self.n_comp   = n_comp
+        #init.orthogonal_(self.weight)              # start orthonormal
+
+    @torch.no_grad()
+    def orthonormalise(self):
+        W = self.weight.view(self.proj_dim,self.n_comp, -1)
+        # project each block independently with QR
+        for i in range(self.n_comp):
+            q, _      = torch.linalg.qr(W[:,i].T, mode="reduced")  # (in, proj_dim)
+            W[:,i].copy_(q.T)
+        # blocks are already mutually orthogonal because rows are unique
+
+
+class LinearModel(nn.Module):
+    def __init__(self, input_dim, proj_dim, n_comp,
+                 device="cuda", dtype=torch.float32, random_state=None):
+        super().__init__()
+        if random_state is not None:
+            torch.manual_seed(random_state)
+
+        self.proj_dim = proj_dim
+        self.n_comp   = n_comp
+
+        self.model = BlockOrthoLinear(input_dim, proj_dim, n_comp,
+                                      device=device, dtype=dtype)
+
+    def forward(self, x):
+        # (..., input_dim) -> (..., proj_dim, n_comp)
+
+        #with torch.no_grad():
+        #    W = self.model.weight
+        #    Wb = W.view(-1, self.proj_dim, self.n_comp)
+        #    denom = Wb.norm(dim=(0,1), keepdim=True).clamp_min(1e-12)
+        #    W.copy_((Wb / denom).view_as(W))
+        y = self.model(x)                                   # (..., n_comp*proj_dim)
+        return y.view(*x.shape[:-1], self.proj_dim, self.n_comp)
+
+    @torch.no_grad()
+    def get_weights(self):
+        W = self.model.weight.view(self.proj_dim,self.n_comp,
+                                      -1).cpu()
+        return W.permute(2, 1, 0).detach().numpy()
+
 
 class NonlinearModel(nn.Module):
     def __init__(self, input_dim, proj_dim, n_comp, device="cuda", dtype=torch.float32, random_state=None):
