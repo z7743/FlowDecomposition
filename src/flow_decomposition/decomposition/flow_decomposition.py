@@ -63,7 +63,7 @@ class FlowDecomposition:
             sample_size, library_size, exclusion_rad=0, method="knn",metric="corr",
             theta=None, nbrs_num=None, time_intv=1, num_epochs=100, num_rand_samples=32,
             batch_size=1, beta=0, optim_policy="range",
-            mask_size=None):
+            mask_size=None,include_opposite_tp=False):
         """
         Fit the model using the provided data.
         """
@@ -75,7 +75,7 @@ class FlowDecomposition:
 
         dataloader = self._create_dataloader(X, sample_size, library_size,
                                             time_intv, num_rand_samples, batch_size,
-                                            optim_policy)
+                                            optim_policy,include_opposite_tp=include_opposite_tp)
         
         self.metric_name = metric
         self.metric = get_metric(metric) 
@@ -111,7 +111,7 @@ class FlowDecomposition:
                       sample_size, library_size, exclusion_rad=0, method="knn",
                       theta=None, nbrs_num=None, time_intv=1,
                       num_epochs=None, num_rand_samples=32, batch_size=1, beta=None,
-                      optim_policy="range", mask_size=None):
+                      optim_policy="range", mask_size=None,include_opposite_tp=False):
         """
         Evaluate the CCM-based loss on test data, with no parameter updates.
         """
@@ -128,7 +128,8 @@ class FlowDecomposition:
                                                 time_intv,
                                                 num_rand_samples,
                                                 batch_size,
-                                                optim_policy)
+                                                optim_policy,
+                                                include_opposite_tp)
             # Accumulate CCM-based loss
             ccm_loss = self._compute_loss_from_dataloader(dataloader,
                                                         num_rand_samples,
@@ -180,7 +181,7 @@ class FlowDecomposition:
 
     def _create_dataloader(self, X, sample_size, library_size, 
                        time_intv, num_rand_samples, batch_size, 
-                       optim_policy):
+                       optim_policy,include_opposite_tp=False):
         """
         Internal helper to build a DataLoader from the input data and the
         specified sampling policy.
@@ -205,6 +206,7 @@ class FlowDecomposition:
             num_batches = num_rand_samples,
             tp_range = tp_range,
             device = self.data_device,
+            include_opposite = include_opposite_tp
             #random_state = self.random_state,
         )
         dataloader = DataLoader(dataset, 

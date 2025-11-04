@@ -1,7 +1,7 @@
 import numpy as np
 from sklearn.model_selection import KFold
 import copy
-from FastCCM import PairwiseCCM
+from fastccm import PairwiseCCM
 from scipy.stats import pearsonr
 
 class ModelCV:
@@ -135,11 +135,11 @@ class ModelCV:
                     Y_val = Y_val[rand_i]
 
                     Y_pred = np.array([
-                            PairwiseCCM(device).predict(X_train_z[None], 
+                            PairwiseCCM(device).predict_matrix(X_train_z[None], 
                                                         Y_train[None],
                                                         X_val_z[None],
-                                                        subset_size=eval_params["library_size"],
-                                                        exclusion_rad=eval_params["exclusion_rad"],tp=tp,
+                                                        library_size=eval_params["library_size"],
+                                                        exclusion_window=eval_params["exclusion_rad"],tp=tp,
                                                         method="simplex" if eval_params["method"] == "knn" else "smap",
                                                         theta=eval_params["theta"], nrst_num = eval_params["nbrs_num"])[:,:,0,0]
                             for _ in range(repeat)
